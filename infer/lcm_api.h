@@ -1,0 +1,84 @@
+/* LCM Inference Engine — C API for Python ctypes bridge
+ *
+ * Exposes flat-array inference entry point that Python can call via ctypes.
+ * No structs, no pointers-to-pointers: everything is float* or int.
+ *
+ * Usage (Python):
+ *   lib = ctypes.CDLL("infer/liblcm.so")
+ *   result = lib.lcm_infer(z_ptr, d, ...)
+ */
+#ifndef LCM_API_H
+#define LCM_API_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ─── Single-step cognitive inference ──────────────────────────────────────
+ *
+ * Constructs engine state from flat arrays, runs build_dag → execute_dag →
+ * fusion in a single step (no convergence loop), returns fused z_q.
+ *
+ * All codebook arrays are flat float32 in row-major order: [M * d].
+ * Pointers must remain valid for the duration of the call.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int lcm_infer_step(const float* z, int d,
+                   const float* hrq_C, int hrq_M,
+                   const float* sparse_C, int sparse_M,
+                   const float* lr_C, int lr_M,
+                   const float* man_C, int man_M,
+                   const float* man_T, int man_t_dim,
+                   const float* bind_C, int bind_M,
+                   const float* contrast_C, int contrast_M,
+                   const float* gv_pos, int gv_n,
+                   const float* gv_neg,
+                   int n_lattices,
+                   float* z_out);
+
+/* ─── Full cognitive inference loop (multi-step until convergence) ────────
+ *
+ * Like lcm_infer_step but runs the full dynamic_inference loop:
+ *   build_dag → execute_dag → fusion → detect_any_conflict → converge_check
+ *
+ * Returns 0 on normal convergence, -1 on conflict or max_steps exceeded.
+ * On conflict, z_out is still populated (last fused output before abort).
+ */
+int lcm_infer_loop(const float* z, int d,
+                   const float* hrq_C, int hrq_M,
+                   const float* sparse_C, int sparse_M,
+                   const float* lr_C, int lr_M,
+                   const float* man_C, int man_M,
+                   const float* man_T, int man_t_dim,
+                   const float* bind_C, int bind_M,
+                   const float* contrast_C, int contrast_M,
+                   const float* gv_pos, int gv_n,
+                   const float* gv_neg,
+                   const float* danger_t, int danger_m,
+                   const float* danger_n,
+                   int n_lattices,
+                   float conv_tol, float entropy_thresh, int max_steps,
+                   float* z_out);
+
+/* ─── Trace extraction for visualization ──────────────────────────────────────
+ *
+ * After lcm_infer_loop returns, call this to extract per-step trace data.
+ * The trace holds one record per inference step (up to max_steps).
+ *
+ * Buffer layout (per step, in order):
+ *   fusion_weights[LCM_MAX_LATTICES]   (7 floats)
+ *   confidences[LCM_MAX_LATTICES]       (7 floats)
+ *   z_next[LCM_D]                       (d floats)
+ *   step (int as float)                 (1 float)
+ *   has_conflict (int as float)         (1 float)
+ *
+ * Returns the number of steps recorded, or 0 if no trace available.
+ * The buffer must have space for at least max_steps * (7 + 7 + LCM_D + 2) floats.
+ */
+int lcm_get_trace(float* trace_buf, int buf_capacity_floats);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* LCM_API_H */

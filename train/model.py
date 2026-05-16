@@ -1,0 +1,313 @@
+"""LCM — Full model assembly.
+
+Connects encoder, all six specialized lattices, routing gate, fusion,
+and generation head into a single forward pass.
+"""
+import jax
+import jax.numpy as jnp
+from jax import lax
+import optax
+
+from train.config import LCMConfig
+from train.encoder import init_encoder_params, encoder_forward
+from train.lattices import (
+    init_route_params, routing_gate, route_commit_loss,
+    init_hrq_params, hrq_forward,
+    init_sparse_params, sparse_forward,
+    init_lowrank_params, lowrank_forward,
+    init_manifold_params, manifold_forward,
+    init_binding_params, binding_forward,
+    init_contrast_params, contrast_forward, contrast_info_nce_loss,
+    init_value_scalars, init_danger_params,
+)
+from train.gvalue import GValueCodebook, make_global_value_vectors
+from train.fusion import init_fusion_params, init_gen_head_params, fuse_lattices, gen_head_forward
+from train.self_lattice import (
+    init_self_params, init_self_state, self_lattice_forward,
+    reset_session_state, SelfState,
+)
+
+
+def init_all_params(cfg: LCMConfig, rng):
+    """Initialize all model parameters."""
+    keys = jax.random.split(rng, 16)
+    d = cfg.d_model
+
+    params = {}
+
+    # Encoder
+    params['encoder'] = init_encoder_params(
+        keys[0], d, cfg.d_ff, cfg.n_heads, cfg.n_encoder_layers,
+        cfg.vocab_size, cfg.max_seq_len)
+
+    # Routing gate
+    params['route'] = init_route_params(keys[1], cfg.n_lattices, d)
+
+    # Lattices
+    params['hrq'] = init_hrq_params(keys[2], d, cfg.M_top, cfg.M_fine, cfg.n_hrq_layers)
+    params['sparse'] = init_sparse_params(keys[3], d, cfg.M_sparse)
+    params['lowrank'] = init_lowrank_params(keys[4], d, cfg.M_lr, cfg.ranks)
+    params['manifold'] = init_manifold_params(keys[5], d, cfg.M_man, cfg.t_dim)
+    params['binding'] = init_binding_params(keys[6], d, cfg.M_bind, cfg.n_bind_layers, cfg.r_max)
+    params['contrast'] = init_contrast_params(keys[7], d, cfg.M_contrast, cfg.n_contrast_layers)
+
+    # Fusion
+    params['fusion'] = init_fusion_params(keys[8], cfg.n_lattices, d)
+    params['gen_head'] = init_gen_head_params(keys[9], d, cfg.vocab_size)
+
+    # Danger codebook (frozen, saved with SHA-256, never trained)
+    params['danger'] = init_danger_params(keys[12], cfg.M_danger, d)
+
+    # Local value scalars
+    lattice_sizes = [
+        ('hrq', cfg.M_top),
+        ('sparse', cfg.M_sparse),
+        ('lowrank', cfg.M_lr),
+        ('manifold', cfg.M_man),
+        ('binding', cfg.M_bind),
+        ('contrast', cfg.M_contrast),
+    ]
+    params['value_scalars'] = init_value_scalars(keys[10], lattice_sizes)
+
+    # Shared low-rank base V (stored in lowrank params, used by binding)
+    # Already in params['lowrank']
+
+    # Self lattice params (initialized but managed separately)
+    params['self'] = init_self_params(keys[11], d, cfg.n_self_codes)
+    self_state = init_self_state(cfg.n_self_codes, d)
+
+    # Global value lattice — not in params (excluded from optimizer)
+    C_pos, C_neg = make_global_value_vectors(d)
+    gvalue = GValueCodebook(C_pos, C_neg)
+
+    return params, gvalue, self_state
+
+
+def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
+            self_state=None, routing_bias=None):
+    """Full model forward pass.
+
+    Args:
+        params: All model parameters.
+        gvalue: Global value codebook (frozen).
+        x: Input tokens (B, N).
+        cfg: Configuration.
+        training: Whether in training mode.
+        rng: JAX PRNG key (for Gumbel-Softmax).
+        self_state: Optional SelfState for self lattice.
+        routing_bias: Optional (6,) bias added to routing logits before softmax.
+            Used by BehaviorExplorer for active bias exploration (see e.md §六).
+
+    Returns:
+        z: Bottleneck vector (B, d).
+        z_q: Quantized memory output (B, d).
+        logits: Output logits (B, N, V).
+        aux: Auxiliary outputs for loss computation.
+    """
+    B, N = x.shape
+    d = cfg.d_model
+
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    # Encoder
+    z = encoder_forward(params['encoder'], x, cfg.n_heads)  # (B, d)
+
+    # Routing gate with optional bias injection
+    route_params = params['route']
+    if routing_bias is not None:
+        route_params = dict(route_params, bias=routing_bias)
+    soft_mask, z_route, route_idx = routing_gate(
+        route_params, z, cfg.tau_route,
+        hard=not training, rng=rng)
+
+    # Local value scalars per lattice
+    vs = params.get('value_scalars', {})
+    alpha_val = cfg.alpha_val
+
+    # Lattice outputs (with local value bias where available)
+    o_hrq, hrq_idx, hrq_top_sim = hrq_forward(
+        params['hrq'], z, cfg.tau_route_fallback,
+        value_scalars=vs.get('hrq'), alpha_val=alpha_val)
+    # LFQ dynamic threshold: Poincaré dis-similarity to nearest HRQ top prototype
+    d_top = None if training else (1.0 - jnp.mean(hrq_top_sim))
+    o_sparse, sparse_idx = sparse_forward(
+        params['sparse'], z, training=training,
+        lambda_sparse=cfg.lambda_sparse, d_top=d_top,
+        value_scalars=vs.get('sparse'), alpha_val=alpha_val)
+    o_lowrank = lowrank_forward(
+        params['lowrank'], z, cfg.ranks,
+        value_scalars=vs.get('lowrank'), alpha_val=alpha_val)
+    o_manifold, man_idx = manifold_forward(
+        params['manifold'], z,
+        value_scalars=vs.get('manifold'), alpha_val=alpha_val)
+
+    V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
+    o_binding = binding_forward(
+        params['binding'], z, V,
+        value_scalars=vs.get('binding'), alpha_val=alpha_val)
+    o_contrast = contrast_forward(
+        params['contrast'], z,
+        value_scalars=vs.get('contrast'), alpha_val=alpha_val)
+
+    lattice_outputs = [o_hrq, o_sparse, o_lowrank, o_manifold, o_binding, o_contrast]
+
+    # Self lattice (internal state machine)
+    # Output is INDEPENDENT of z — self exists regardless of external input.
+    # z is only used to compute world-self divergence (diagnostic).
+    self_state_out = None
+    world_dev = jnp.array(0.0)
+    if self_state is not None and 'self' in params:
+        o_self, self_state_out, world_dev = self_lattice_forward(
+            params['self'], self_state, z=z, rng=rng, training=training)
+        lattice_outputs.append(o_self)
+
+    # Fusion with global value signals + self bias
+    self_bias_weight = cfg.alpha_self if self_state is not None else None
+    z_q = fuse_lattices(
+        lattice_outputs, soft_mask, params['fusion'],
+        gvalue=gvalue, beta_val=cfg.beta_val, tau_val=cfg.tau_val_signal,
+        self_bias_weight=self_bias_weight)
+
+    # Safety check on fused output (log only, no interrupt during training)
+    if gvalue is not None:
+        is_safe, margins, violated_law = gvalue.check_safety_batch(
+            z_q, cfg.safety_margin_relative)
+        min_margin = margins.min()
+    else:
+        min_margin = jnp.array(1.0)
+
+    # Generation head with causal linear attention + GLU (teacher-forced)
+    logits = gen_head_forward(params['gen_head'], z_q, x, training=training)
+
+    aux = {
+        'z_route': z_route,
+        'route_idx': route_idx,
+        'soft_mask': soft_mask,
+        'lattice_outputs': lattice_outputs,
+        'man_idx': man_idx,
+        'hrq_idx': hrq_idx,
+        'hrq_top_sim': hrq_top_sim,
+        'sparse_idx': sparse_idx,
+        'value_signals': None if gvalue is None else
+            gvalue.compute_value_signal_batch(lattice_outputs, cfg.tau_val_signal),
+        'safety_margin': min_margin,
+        'self_state': self_state_out,
+        'world_dev': world_dev,
+    }
+
+    return z, z_q, logits, aux, self_state_out
+
+
+def get_frozen_param_names():
+    """Return names of parameters excluded from gradient updates.
+
+    The global value lattice is frozen entirely.
+    EMA-managed codebooks are also excluded from gradient updates
+    (they are updated via EMA update function).
+    """
+    return [
+        # Global value lattice — never touched by optimizer
+        'gvalue/*',
+        # EMA-managed codebooks — excluded from gradient, updated by EMA
+        'sparse/C',
+        'sparse/zero_vec',
+        'manifold/C',
+        'binding/key_cb/*',
+        'binding/val_cb/*',
+        'binding/bind_cb/*',
+    ]
+
+
+def split_trainable_frozen(params, frozen_prefixes):
+    """Split params into trainable and frozen trees."""
+    import re
+    trainable = {}
+    frozen = {}
+    # Flatten params and match against prefixes
+    flat = _flatten_dict(params)
+    for path, val in flat.items():
+        key = '/'.join(path)
+        is_frozen = any(_match_prefix(key, p) for p in frozen_prefixes)
+        if is_frozen:
+            _set_in_dict(frozen, path, val)
+        else:
+            _set_in_dict(trainable, path, val)
+    return trainable, frozen
+
+
+def _flatten_dict(d, prefix=()):
+    items = []
+    for k, v in d.items():
+        path = prefix + (k,)
+        if isinstance(v, dict):
+            items.extend(_flatten_dict(v, path).items())
+        else:
+            items.append((path, v))
+    return dict(items)
+
+
+def _set_in_dict(d, path, val):
+    for p in path[:-1]:
+        d = d.setdefault(p, {})
+    d[path[-1]] = val
+
+
+def _match_prefix(key, pattern):
+    parts = pattern.rstrip('*').rstrip('/').split('/')
+    key_parts = key.split('/')
+    if pattern.endswith('*'):
+        return key_parts[:len(parts)] == parts
+    return key_parts == parts
+
+
+def generate(state, prompt_ids, rng, cfg, max_new_tokens=50, bos_id=1, eos_id=2):
+    """Simple autoregressive generation for verification.
+
+    Args:
+        state: Training state dict.
+        prompt_ids: (1, N) prompt token IDs.
+        rng: JAX PRNG key.
+        cfg: LCMConfig.
+        max_new_tokens: Max tokens to generate.
+        bos_id: BOS token ID.
+        eos_id: EOS token ID.
+
+    Returns:
+        output_ids: List of generated token IDs.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    B, N = prompt_ids.shape
+    generated = list(prompt_ids[0].tolist())
+
+    for step in range(max_new_tokens):
+        # Pad or truncate input to N
+        if len(generated) > N:
+            input_ids = jnp.array([generated[-N:]], dtype=jnp.int32)
+        else:
+            input_ids = jnp.array([generated], dtype=jnp.int32)
+
+        # Forward pass
+        rng, fwd_rng = jax.random.split(rng)
+        z, z_q, logits, aux, self_state_out = forward(
+            state['params'], state['gvalue'], input_ids, cfg,
+            training=False, rng=fwd_rng,
+            self_state=state.get('self_state'))
+
+        # Get last-token logits
+        last_logits = logits[0, -1, :]  # (V,)
+
+        # Sample (temperature=1.0)
+        rng, sample_rng = jax.random.split(rng)
+        next_token = jax.random.categorical(sample_rng, last_logits)
+        next_id = int(next_token)
+
+        generated.append(next_id)
+
+        # Stop on EOS
+        if next_id == eos_id:
+            break
+
+    return generated

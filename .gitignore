@@ -1,0 +1,61 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# --- Cython build artifacts ---
+build/
+train/*.c
+train/*.so
+train/*.cpython-*.so
+
+# --- C inference engine build artifacts ---
+infer/*.o
+infer/*.a
+infer/*.so
+infer/test_runner
+
+# --- Checkpoints & training data ---
+checkpoints/
+data/
+
+# --- Raw data files (Wikipedia dumps, corpus, extracts, etc.) ---
+extracted/
+*.bz2
+*.jsonl
+*.txt
+*.bin
+*.dat
+
+# --- Generated output ---
+*.html
+
+# --- IDE / editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Claude Code ---
+.claude/
+CLAUDE.md
+
+# --- Test cache ---
+.pytest_cache/
+.hypothesis/
+
+# --- Virtual environments ---
+.venv/
+be/
+
+# --- Environment / secrets ---
+.env
+.env.*
