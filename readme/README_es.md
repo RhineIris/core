@@ -71,7 +71,7 @@ flowchart TB
         I2 -->|Sí| I3[Codificación completa del codificador<br/>+ Construir estado incremental]
         I2 -->|No| I4[¿Cada 256 pasos?]
         I4 -->|Sí| I5[Recodificación completa<br/>Restablecer deriva acumulada]
-        I4 -->|No| I6[Codificación incremental<br/>Actualización O(d²) por paso]
+        I4 -->|No| I6["Codificación incremental, actualización O(d²) por paso"]
         I3 --> I7[Vector de cuello de botella z]
         I5 --> I7
         I6 --> I7

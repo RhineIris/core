@@ -71,7 +71,7 @@ flowchart TB
         I2 -->|Yes| I3[Full Encoder Encoding<br/>+ Build Incremental State]
         I2 -->|No| I4[Every 256 steps?]
         I4 -->|Yes| I5[Full Re-encoding<br/>Reset Cumulative Drift]
-        I4 -->|No| I6[Incremental Encoding<br/>O(d²) Single-Step Update]
+        I4 -->|No| I6["Incremental Encoding O(d²) Single-Step Update"]
         I3 --> I7[Bottleneck Vector z]
         I5 --> I7
         I6 --> I7
