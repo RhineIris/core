@@ -283,7 +283,8 @@ def train(args):
                 f"vq={float(comps['vq']):.4f}",
             ]
             for key, label in [("contrast", "ctrst"), ("orth", "orth"),
-                               ("val", "val"), ("ewc", "ewc"), ("margin", "mgn")]:
+                               ("val", "val"), ("ewc", "ewc"), ("margin", "mgn"),
+                               ("self", "self")]:
                 v = comps.get(key, 0.0)
                 if v is not None:
                     parts.append(f"{label}={float(v):.4f}")

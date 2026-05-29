@@ -336,11 +336,16 @@ def _build_loss_grad_fn(params, gvalue, inputs, targets, cfg, rng, ewc_loss_val)
 
 def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
                  inputs, targets, cfg_dict, rng, ewc_loss_val,
-                 ema_state, feature_bank, step):
+                 ema_state, feature_bank, step,
+                 self_state=None):
     """Training step with jax.grad (auto-jitted) — outer function not jit-decorated
     because cfg_dict contains shape-determining values (n_heads, d_model) that
-    must be concrete for reshape ops."""
+    must be concrete for reshape ops.
+
+    self_state is a dict (from init_self_state) — it flows through the trace
+    because JAX can trace dicts whose leaves are arrays."""
     from train.model import forward as fwd
+    from train.self_lattice import self_lattice_reg_loss
     from train.hyp import poincare_distance
     B, N = inputs.shape
     d = cfg_dict['d_model']
@@ -350,7 +355,8 @@ def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
     def loss_fn(p):
         z, z_q, logits, aux, _ = fwd(
             p, None, inputs, _cfg_from_dict(cfg_dict),
-            training=True, rng=subkeys[0])
+            training=True, rng=subkeys[0],
+            self_state=self_state)
 
         def _euclidean_batch(x, y):
             return jnp.linalg.norm(x[:, None, :] - y[None, :], axis=-1)
@@ -374,6 +380,13 @@ def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
         loss_val = cfg_dict['lambda_val'] * _value_contrast_loss_inline(
             aux['lattice_outputs'], gvalue_C_pos, gvalue_C_neg, cfg_dict)
         total = loss_lm + loss_vq + loss_contrast + loss_orth + loss_val
+
+        # Self lattice regularization loss (if self_state is active)
+        loss_self = jnp.array(0.0)
+        if self_state is not None and 'self' in p:
+            loss_self = self_lattice_reg_loss(p['self'], aux.get('self_state', self_state))
+            total = total + loss_self
+
         if ewc_loss_val is not None:
             total = total + ewc_loss_val
 
@@ -396,6 +409,7 @@ def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
             'soft_mask': aux.get('soft_mask'),
             'hrq_top_sim': aux.get('hrq_top_sim'),
             'convergence_diff': jnp.array(0.0),
+            'self': loss_self,
         }
         return total, (z, z_q, logits, aux, components)
 
@@ -456,7 +470,8 @@ def train_step(state, batch, rng):
         inputs, targets, cfg_dict, subkeys[0],
         ewc_val,
         state['ema_state'], state['feature_bank'],
-        state['step'])
+        state['step'],
+        self_state=state.get('self_state'))
 
     new_state = {
         'params': params_new,
@@ -801,7 +816,7 @@ def train_loop(state, data_iter, num_steps, log_every=100,
         # Metrics tracking (every 50 steps)
         if step % 50 == 0:
             log_kw = {}
-            for k in ('lm', 'vq', 'contrast', 'orth', 'val', 'ewc', 'margin'):
+            for k in ('lm', 'vq', 'contrast', 'orth', 'val', 'ewc', 'margin', 'self'):
                 if k in components:
                     log_kw[k] = float(components[k])
             if log_kw:
@@ -831,12 +846,12 @@ def train_loop(state, data_iter, num_steps, log_every=100,
             try:
                 self_p = state['params'].get('self')
                 self_s = state['self_state']
-                if self_p is not None and hasattr(self_s, 'mode_activation'):
+                if self_p is not None and 'mode_activation' in self_s:
                     from train.self_lattice import narrative_keep_score
                     import jax
                     # Extract numpy arrays once
                     p_np = jax.device_get(self_p)
-                    ma_np = jax.device_get(self_s.mode_activation)
+                    ma_np = jax.device_get(self_s['mode_activation'])
 
                     def _scorer(r):
                         return narrative_keep_score(p_np, ma_np, r)
@@ -1069,9 +1084,22 @@ def load_checkpoint(path, cfg, rng, enable_continual=True):
     from train.continual import init_continual_state
     continual = init_continual_state(cfg.d_model) if enable_continual else None
 
-    # Self state (re-init; state machine state rebuilt during training)
-    from train.self_lattice import init_self_state
-    self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
+    # Self state (restore from checkpoint if saved, otherwise re-init)
+    ckpt_self_state = ckpt.get('self_state')
+    if ckpt_self_state is not None and isinstance(ckpt_self_state, dict):
+        from train.self_lattice import init_self_state
+        # Re-create with JAX arrays from saved numpy/pickle values
+        saved = {k: _to_jax(v) if hasattr(v, 'shape') else v
+                 for k, v in ckpt_self_state.items()}
+        # Ensure shape matches cfg
+        if saved.get('mode_activation', jnp.zeros(1)).shape[0] == cfg.n_self_codes:
+            self_state = saved
+            print(f"[CKPT] Self state restored from checkpoint")
+        else:
+            self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
+    else:
+        from train.self_lattice import init_self_state
+        self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
 
     state = {
         'params': params,

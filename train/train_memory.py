@@ -51,7 +51,8 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
     n_heads = cfg.n_heads
 
     @jax.jit
-    def memory_step(params, ema_state, feature_bank, opt_state, batch, step, rng):
+    def memory_step(params, ema_state, feature_bank, opt_state, batch, step, rng,
+                    self_state=None):
         inputs, targets = batch
         B, N = inputs.shape
         rng, *subkeys = jax.random.split(rng, 5)
@@ -59,7 +60,8 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
         # ── Loss function for gradient computation ────────────────────
         def loss_fn(p):
             z, z_q, logits, aux, _ = forward(
-                p, None, inputs, cfg, training=True, rng=subkeys[0])
+                p, None, inputs, cfg, training=True, rng=subkeys[0],
+                self_state=self_state)
 
             # Freeze gen_head: stop gradients from flowing through it
             p['gen_head'] = lax.stop_gradient(p['gen_head'])
@@ -80,12 +82,19 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
             else:
                 loss_orth = 0.0
 
+            # Self lattice regularization (if self_state is active)
+            loss_self = jnp.array(0.0)
+            if self_state is not None and 'self' in p:
+                from train.self_lattice import self_lattice_reg_loss
+                loss_self = self_lattice_reg_loss(p['self'], aux.get('self_state', self_state))
+
             components = {
                 'vq': loss_vq_total,
                 'contrast': loss_contrast,
                 'orth': loss_orth,
+                'self': loss_self,
             }
-            return loss_vq_total + loss_contrast + loss_orth, (z, z_q, logits, aux, components)
+            return loss_vq_total + loss_contrast + loss_orth + loss_self, (z, z_q, logits, aux, components)
 
         (total, (z, z_q, logits, aux, components)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
@@ -207,6 +216,7 @@ def train_memory(cfg, data_path, shape_path, output_dir,
             'ptr': jnp.array(0),
             'last_used': jnp.zeros(cfg.bank_capacity, dtype=jnp.int32),
         }
+        self_state = None
     else:
         print("[MEMORY] Initializing full model parameters...")
         params, gvalue, self_state = init_all_params(cfg, init_rng)
@@ -265,7 +275,7 @@ def train_memory(cfg, data_path, shape_path, output_dir,
 
     # ── Graceful shutdown ─────────────────────────────────────────────
     def _handler(sig, frame):
-        _save_ckpt(params, gvalue, opt_state, cfg, output_dir, step)
+        _save_ckpt(params, gvalue, opt_state, cfg, output_dir, step, self_state=self_state)
         print(f"\nSaved interrupt checkpoint → {output_dir}/")
         sys.exit(0)
     signal.signal(signal.SIGINT, _handler)
@@ -280,7 +290,7 @@ def train_memory(cfg, data_path, shape_path, output_dir,
     from tqdm import tqdm
     from train.monitor import MetricsRecorder
     recorder = MetricsRecorder(save_dir=output_dir, window=50)
-    running_loss = {'vq': 0.0, 'contrast': 0.0, 'orth': 0.0}
+    running_loss = {'vq': 0.0, 'contrast': 0.0, 'orth': 0.0, 'self': 0.0}
     start_time = time.time()
     pbar = tqdm(total=steps - start_step, desc="   stage 2 training", unit="step",
                 initial=start_step)
@@ -292,7 +302,12 @@ def train_memory(cfg, data_path, shape_path, output_dir,
         current_lr = schedule(step - start_step)
 
         params, ema_state, feature_bank, opt_state, comps, aux = memory_step(
-            params, ema_state, feature_bank, opt_state, batch, step, step_rng)
+            params, ema_state, feature_bank, opt_state, batch, step, step_rng,
+            self_state=self_state)
+
+        # Update self state from forward pass
+        if self_state is not None and aux.get('self_state') is not None:
+            self_state = aux['self_state']
 
         # Restore frozen gen_head (memory_step zeros its gradients, but restore to be safe)
         params['gen_head'] = lax.stop_gradient(params_gh_frozen)
@@ -306,6 +321,7 @@ def train_memory(cfg, data_path, shape_path, output_dir,
                 vq=float(comps.get('vq', 0.0)),
                 contrast=float(comps.get('contrast', 0.0)),
                 orth=float(comps.get('orth', 0.0)),
+                self_loss=float(comps.get('self', 0.0)),
                 lr=float(current_lr),
             )
 
@@ -316,14 +332,19 @@ def train_memory(cfg, data_path, shape_path, output_dir,
             avg_vq = running_loss['vq'] / log_every
             avg_ct = running_loss['contrast'] / log_every
             avg_orth = running_loss['orth'] / log_every
-            tqdm.write(f"  step {step:>6d} | vq={avg_vq:.4f} | contrast={avg_ct:.4f} | "
-                       f"orth={avg_orth:.4f} | {tok_s:.0f} tok/s")
-            running_loss = {'vq': 0.0, 'contrast': 0.0, 'orth': 0.0}
+            avg_self = running_loss['self'] / log_every
+            parts = [f"  step {step:>6d} | vq={avg_vq:.4f} | contrast={avg_ct:.4f} | "
+                     f"orth={avg_orth:.4f}"]
+            if avg_self > 0:
+                parts.append(f"self={avg_self:.6f}")
+            parts.append(f"| {tok_s:.0f} tok/s")
+            tqdm.write("".join(parts))
+            running_loss = {'vq': 0.0, 'contrast': 0.0, 'orth': 0.0, 'self': 0.0}
             start_time = time.time()
 
         # Save checkpoint
         if save_every > 0 and step > 0 and step % save_every == 0:
-            _save_ckpt(params, gvalue, opt_state, cfg, output_dir, step)
+            _save_ckpt(params, gvalue, opt_state, cfg, output_dir, step, self_state=self_state)
             recorder.save()
 
         pbar.update(1)
@@ -336,13 +357,14 @@ def train_memory(cfg, data_path, shape_path, output_dir,
     print(f"[MEMORY] Training complete! Final checkpoint in {output_dir}/")
 
 
-def _save_ckpt(params, gvalue, opt_state, cfg, output_dir, step):
+def _save_ckpt(params, gvalue, opt_state, cfg, output_dir, step, self_state=None):
     """Save full-format checkpoint with memory parameters."""
     from train.checkpoint import save_checkpoint as bin_save
     state = {
         'params': params,
         'gvalue': gvalue,
         'opt_state': opt_state,
+        'self_state': self_state,
     }
     bin_save(state, cfg, output_dir=output_dir, step=step)
 

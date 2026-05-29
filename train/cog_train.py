@@ -30,6 +30,10 @@ from train.lattices import (
     init_hrq_params, init_sparse_params, init_lowrank_params,
     init_manifold_params, init_binding_params, init_contrast_params,
 )
+from train.self_lattice import (
+    init_self_params, init_self_state, self_lattice_forward,
+    self_lattice_reg_loss,
+)
 from train.cog_loop import cog_loop_scan
 
 
@@ -40,6 +44,10 @@ def init_cog_params(cfg, rng, lm_ckpt=None):
 
     Passive channel: W_out (trained from scratch).
     Active channel: gen_head + w_start (loadable from Stage 1 LM checkpoint).
+
+    Returns:
+        params: Dict of all parameters (including self-lattice).
+        self_state: Dict for self-lattice runtime state.
     """
     keys = jax.random.split(rng, 12)
     d = cfg.d_model
@@ -58,6 +66,10 @@ def init_cog_params(cfg, rng, lm_ckpt=None):
     params['binding'] = init_binding_params(keys[5], d, cfg.M_bind, cfg.n_bind_layers, cfg.r_max)
     params['contrast'] = init_contrast_params(keys[6], d, cfg.M_contrast, cfg.n_contrast_layers)
 
+    # Self lattice params
+    params['self'] = init_self_params(keys[10], d, cfg.n_self_codes)
+    self_state = init_self_state(cfg.n_self_codes, d)
+
     # Passive channel: transparent consciousness → language projection
     params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
 
@@ -74,7 +86,7 @@ def init_cog_params(cfg, rng, lm_ckpt=None):
         params['gen_head'] = init_gen_head_params(keys[8], d, cfg.vocab_size)
         params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
 
-    return params
+    return params, self_state
 
 
 def _simvq_codebook(simvq):
@@ -194,19 +206,17 @@ def active_loss(logits, targets):
 # ─── Training step ──────────────────────────────────────────────────────────
 
 def make_train_step(cfg, optimizer):
-    """Create jitted training step with dual-channel output.
+    """Create jitted training step with dual-channel output + self-lattice.
 
     Every macro step's z_q feeds both channels:
       - Passive (introspection):  z_q @ W_out → single-token CE
       - Active (expression):      gen_head(z_q) → full-sequence CE
 
-    The passive loss is weak but transparent; the active loss is strong but
-    goes through the skill network. Their combination ensures the cognitive
-    state is both linguistically meaningful and fluently expressible.
+    Self-lattice provides internal state machine (mode selection, self output).
     """
 
     @partial(jax.jit, static_argnums=(4,))
-    def train_step(params, opt_state, batch, lr, step):
+    def train_step(params, opt_state, batch, lr, step, self_state=None):
         inputs, targets = batch
         B, N = inputs.shape
 
@@ -221,6 +231,17 @@ def make_train_step(cfg, optimizer):
                 thresholds=None,
                 tau=0.1)
             # z_qs: (max_steps, d), diffs: (max_steps,), entropies: (max_steps,)
+
+            # ── Self lattice ────────────────────────────────────────────
+            # Use the final conscious state to drive self dynamics
+            rng_self = jax.random.PRNGKey(step)
+            self_state_out = None
+            loss_self = jnp.array(0.0)
+            if self_state is not None and 'self' in p:
+                o_self, self_state_out, world_dev = self_lattice_forward(
+                    p['self'], self_state, z=z_qs[-1][None, :],
+                    rng=rng_self, training=True)
+                loss_self = self_lattice_reg_loss(p['self'], self_state_out)
 
             # Passive channel: transparent introspection at every macro step
             passive_losses = []
@@ -237,7 +258,7 @@ def make_train_step(cfg, optimizer):
             a_loss = active_loss(a_logits, targets)
 
             # Combined loss
-            loss = p_loss + a_loss
+            loss = p_loss + a_loss + loss_self
 
             # Convergence bonus: reward efficient thinking
             converged = (diffs[-1] < cfg.convergence_tol) & (entropies[-1] < cfg.entropy_threshold)
@@ -245,14 +266,15 @@ def make_train_step(cfg, optimizer):
             loss = loss + jnp.where(converged,
                                     -0.001 * jnp.log(n_steps + 1e-8), 0.0)
 
-            return loss
+            aux_out = {'self_state': self_state_out, 'loss_self': loss_self}
+            return loss, aux_out
 
-        loss, grads = jax.value_and_grad(loss_fn)(params)
+        (loss, aux_out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = jax.tree_util.tree_map(
             lambda g: jnp.clip(g, -1.0, 1.0), grads)
         updates, new_opt = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt, loss
+        return new_params, new_opt, loss, aux_out
 
     return train_step
 
@@ -270,7 +292,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     rng = jax.random.PRNGKey(42)
 
     rng, init_rng = jax.random.split(rng)
-    params = init_cog_params(cfg, init_rng, lm_ckpt=lm_ckpt)
+    params, self_state = init_cog_params(cfg, init_rng, lm_ckpt=lm_ckpt)
 
     schedule = optax.cosine_decay_schedule(
         init_value=lr, decay_steps=steps, alpha=0.1)
@@ -295,6 +317,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                        if hasattr(p, 'size'))
     has_lm = 'gen_head' in params
     print(f"[COG] Dual-channel: passive (z_q @ W_out) + active (gen_head{' from LM' if lm_ckpt else ' init'})")
+    print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
     print(f"[COG] Total params: {total_params:,}")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
     print()
@@ -307,8 +330,12 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         batch = next(data_iter)
         current_lr = schedule(step)
 
-        params, opt_state, loss_val = train_step(
-            params, opt_state, batch, current_lr, step)
+        params, opt_state, loss_val, aux_out = train_step(
+            params, opt_state, batch, current_lr, step, self_state=self_state)
+
+        # Update self state from forward pass
+        if self_state is not None and aux_out.get('self_state') is not None:
+            self_state = aux_out['self_state']
 
         running_loss += float(loss_val)
 
@@ -316,32 +343,36 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             avg_loss = running_loss / log_every
             elapsed = time.time() - start_time
             tok_s = batch_size * seq_len * log_every / elapsed
-            tqdm.write(f"  step {step:>6d} | loss={avg_loss:.4f} | "
-                       f"lr={current_lr:.2e} | {tok_s:.0f} tok/s")
+            loss_self = float(aux_out.get('loss_self', 0.0))
+            parts = [f"  step {step:>6d} | loss={avg_loss:.4f}"]
+            if loss_self > 0:
+                parts.append(f"self={loss_self:.6f}")
+            parts.append(f"lr={current_lr:.2e} | {tok_s:.0f} tok/s")
+            tqdm.write(" | ".join(parts))
             running_loss = 0.0
             start_time = time.time()
 
         if save_every > 0 and step % save_every == 0 and step > 0:
             ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
-            save_cog_checkpoint(params, ckpt_dir, step)
+            save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state)
 
         pbar.update(1)
 
     pbar.close()
-    save_cog_checkpoint(params, output_dir, steps)
+    save_cog_checkpoint(params, output_dir, steps, self_state=self_state)
     print(f"[COG] Training complete → {output_dir}/")
 
 
 # ─── Checkpoint ──────────────────────────────────────────────────────────────
 
-def save_cog_checkpoint(params, output_dir, step):
+def save_cog_checkpoint(params, output_dir, step, self_state=None):
     """Save full checkpoint + export codebooks + W_out for C engine."""
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "codebooks"), exist_ok=True)
 
     ckpt = jax.tree_util.tree_map(lambda x: np.array(x), params)
     with open(os.path.join(output_dir, "cog_params.pkl"), "wb") as f:
-        pickle.dump({'params': ckpt, 'step': step}, f)
+        pickle.dump({'params': ckpt, 'step': step, 'self_state': self_state}, f)
 
     # Export flat codebook matrices as .bin
     codebooks_flat = pack_codebooks_for_c(params)
@@ -356,12 +387,24 @@ def save_cog_checkpoint(params, output_dir, step):
     print(f"[CKPT] Step {step}: codebooks + W_out ({size_mb:.1f} MB) → {bin_dir}/")
 
 
-def load_cog_checkpoint(path):
-    """Load full cognitive training checkpoint."""
+def load_cog_checkpoint(path, d_model=None, n_self_codes=64):
+    """Load full cognitive training checkpoint.
+
+    Args:
+        path: Path to checkpoint .pkl file.
+        d_model: Model dimension (for re-init self_state if not saved).
+        n_self_codes: Number of self modes.
+
+    Returns:
+        params, step, self_state
+    """
     with open(path, 'rb') as f:
         ckpt = pickle.load(f)
     params = jax.tree_util.tree_map(
         lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
         ckpt['params'])
+    self_state = ckpt.get('self_state')
+    if self_state is None and d_model is not None:
+        self_state = init_self_state(n_self_codes, d_model)
     print(f"[COG] Loaded checkpoint step {ckpt.get('step', '?')}")
-    return params, ckpt.get('step', 0)
+    return params, ckpt.get('step', 0), self_state

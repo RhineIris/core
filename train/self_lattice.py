@@ -12,10 +12,15 @@ World-self divergence is computed as a diagnostic: ||z - core||² measures
 how far the current external context is from the identity anchor.
 
 Usage:
-    from train.self_lattice import SelfLattice, SelfState, init_self_params
-    self_lat = SelfLattice(d=256, n_self_codes=64)
-    state = self_lat.init_state()
-    o_self, state, world_dev = self_lat.forward(params, state, z, rng)
+    from train.self_lattice import init_self_params, init_self_state
+    params = init_self_params(rng, d, n_self_codes)
+    state = init_self_state(n_self_codes, d)
+    o_self, state, world_dev = self_lattice_forward(params, state, z, rng)
+
+Note:
+    SelfState is a dict (not a dataclass) so it passes cleanly through JAX
+    jit boundaries. Use self_state_to_dc(s) to convert to the dataclass form
+    for Python-side attribute access.
 """
 import jax
 import jax.numpy as jnp
@@ -25,20 +30,46 @@ from typing import Optional, Tuple
 
 
 @dataclass
-class SelfState:
-    """Self lattice runtime state — tracks internal dynamics only.
+class SelfStateDC:
+    """Self lattice runtime state (dataclass form, Python-side convenience).
+
+    For JIT-compatible operations use dict form (created by init_self_state).
+    Convert between forms with self_state_from_dc / self_state_to_dc.
 
     Attributes:
         step: Current step counter.
-        mode_activation: (M_self,) momentum of mode usage. Determines which
-            mode is active via softmax — NOT driven by external input.
+        mode_activation: (M_self,) momentum of mode usage.
         temp_avg: (d,) running average of past self outputs.
         gamma_self: Decay rate for mode activation momentum.
     """
     step: int = 0
-    mode_activation: jnp.ndarray = None  # (M_self,)
-    temp_avg: jnp.ndarray = None         # (d,)
+    mode_activation: jnp.ndarray = None
+    temp_avg: jnp.ndarray = None
     gamma_self: float = 0.99
+
+
+def self_state_from_dc(dc: 'SelfStateDC') -> dict:
+    """Convert SelfStateDC dataclass to a JIT-compatible dict."""
+    return {
+        'step': dc.step,
+        'mode_activation': dc.mode_activation,
+        'temp_avg': dc.temp_avg,
+        'gamma_self': dc.gamma_self,
+    }
+
+
+def self_state_to_dc(d: dict) -> 'SelfStateDC':
+    """Convert JIT-compatible dict back to SelfStateDC dataclass."""
+    return SelfStateDC(
+        step=d['step'],
+        mode_activation=d['mode_activation'],
+        temp_avg=d['temp_avg'],
+        gamma_self=d['gamma_self'],
+    )
+
+
+# Convenience alias: SelfState for backward compatibility
+SelfState = SelfStateDC
 
 
 def init_self_params(rng, d, M_self=64):
@@ -73,7 +104,7 @@ def init_self_params(rng, d, M_self=64):
 
 
 def init_self_state(M_self, d):
-    """Initialize self lattice runtime state.
+    """Initialize self lattice runtime state (returns a JIT-compatible dict).
 
     Mode activation starts uniform — no mode is preferred at init.
 
@@ -82,32 +113,33 @@ def init_self_state(M_self, d):
         d: Model dimension.
 
     Returns:
-        SelfState with zeroed tracking arrays.
+        Dict with step, mode_activation, temp_avg, gamma_self.
     """
-    return SelfState(
-        step=0,
-        mode_activation=jnp.ones(M_self) / M_self,  # uniform start
-        temp_avg=jnp.zeros(d),
-        gamma_self=0.99,
-    )
+    return {
+        'step': 0,
+        'mode_activation': jnp.ones(M_self) / M_self,  # uniform start
+        'temp_avg': jnp.zeros(d),
+        'gamma_self': 0.99,
+    }
 
 
-def reset_session_state(state: SelfState, M_self: int, d: int) -> SelfState:
+def reset_session_state(state, M_self, d):
     """Reset session state (called at start of each inference session).
 
     Core identity persists. Mode activation resets to uniform.
+    Accepts and returns dict form for JIT compatibility.
     """
-    return SelfState(
-        step=0,
-        mode_activation=jnp.ones(M_self) / M_self,
-        temp_avg=jnp.zeros(d),
-        gamma_self=0.99,
-    )
+    return {
+        'step': 0,
+        'mode_activation': jnp.ones(M_self) / M_self,
+        'temp_avg': jnp.zeros(d),
+        'gamma_self': 0.99,
+    }
 
 
-def self_lattice_forward(params, state: SelfState, z: Optional[jnp.ndarray] = None,
+def self_lattice_forward(params, state, z: Optional[jnp.ndarray] = None,
                          rng: Optional[jax.Array] = None,
-                         training: bool = True) -> Tuple[jnp.ndarray, SelfState, jnp.ndarray]:
+                         training: bool = True):
     """Self lattice forward pass — output is INDEPENDENT of external input z.
 
     The self output is determined by core identity + selected internal mode.
@@ -116,19 +148,24 @@ def self_lattice_forward(params, state: SelfState, z: Optional[jnp.ndarray] = No
 
     Args:
         params: Self lattice parameters (core, modes, tau_self, bias_self).
-        state: Current SelfState.
+        state: Current self state dict (as returned by init_self_state).
         z: Optional external input (B, d) — NOT used for retrieval, only
            for computing world-self divergence diagnostic.
         rng: PRNG key (for Gumbel-Softmax in training).
         training: Whether in training mode.
 
     Returns:
-        o_self: (B, d) self-modulated output (broadcast over batch).
-        new_state: Updated SelfState.
+        o_self: (1, d) self-modulated output (broadcast over batch).
+        new_state: Updated self state dict (JIT-compatible).
         world_dev: Scalar — mean ||z - core||², measure of world-self distance.
     """
     d = params['core'].shape[0]
     M_self = params['modes'].shape[0]
+
+    # Unpack state (dict form)
+    mode_activation = state['mode_activation']  # (M_self,)
+    temp_avg = state['temp_avg']                # (d,)
+    gamma_self = state.get('gamma_self', 0.99)
 
     # ── Core identity is always frozen ──
     core = lax.stop_gradient(params['core'])  # (d,), permanently frozen
@@ -137,7 +174,7 @@ def self_lattice_forward(params, state: SelfState, z: Optional[jnp.ndarray] = No
     # Mode activation momentum determines which mode is active.
     # This is the key design choice: self state changes based on its own
     # internal dynamics, not on what the external world looks like.
-    logits = params['tau_self'] * state.mode_activation  # (M_self,)
+    logits = params['tau_self'] * mode_activation  # (M_self,)
 
     if training:
         # Gumbel-Softmax for differentiable mode selection
@@ -171,21 +208,20 @@ def self_lattice_forward(params, state: SelfState, z: Optional[jnp.ndarray] = No
     # ── State update: mode activation momentum ──
     # Modes decay uniformly, then the selected mode gets a boost.
     # This creates smooth mode transitions (no flickering).
-    gamma = getattr(state, 'gamma_self', 0.99)
-    decayed = gamma * state.mode_activation
-    boost = (1.0 - gamma) * mode_weights
+    decayed = gamma_self * mode_activation
+    boost = (1.0 - gamma_self) * mode_weights
     new_activation = decayed + boost
     new_activation = new_activation / (new_activation.sum() + 1e-8)  # re-normalise
 
     # Running average of self outputs (temporal continuity)
-    new_temp_avg = 0.99 * state.temp_avg + 0.01 * self_vec
+    new_temp_avg = 0.99 * temp_avg + 0.01 * self_vec
 
-    new_state = SelfState(
-        step=state.step + 1,
-        mode_activation=new_activation,
-        temp_avg=new_temp_avg,
-        gamma_self=gamma,
-    )
+    new_state = {
+        'step': state['step'] + 1,
+        'mode_activation': new_activation,
+        'temp_avg': new_temp_avg,
+        'gamma_self': gamma_self,
+    }
 
     return o_self, new_state, world_dev
 
@@ -200,7 +236,8 @@ def narrative_keep_score(params_np, mode_activation_np, record):
     Args:
         params_np: Self-lattice params as numpy arrays
             (core, modes extracted via jax.device_get).
-        mode_activation_np: (M_self,) numpy array — current mode activation.
+        mode_activation_np: (M_self,) numpy array — current mode activation
+            (from state['mode_activation']).
         record: NarrativeRecord or StepRecord to evaluate.
 
     Returns:
@@ -238,12 +275,16 @@ def narrative_keep_score(params_np, mode_activation_np, record):
     return float(_np.clip(score, 0.0, 1.0))
 
 
-def self_lattice_reg_loss(params, state: SelfState) -> jnp.ndarray:
+def self_lattice_reg_loss(params, state) -> jnp.ndarray:
     """Regularization loss for self lattice.
 
     Encourages:
     1. Mode diversity: modes should not all collapse to the same vector.
     2. Mode stability: mode activation should have some entropy (not lock on one forever).
+
+    Args:
+        params: Self lattice params dict (core, modes, tau_self, bias_self).
+        state: Self state dict (mode_activation, temp_avg, ...).
 
     Returns:
         Scalar loss.
@@ -262,7 +303,7 @@ def self_lattice_reg_loss(params, state: SelfState) -> jnp.ndarray:
     diversity_penalty = 0.01 * jnp.clip(avg_sim - 0.3, 0.0)  # penalise >0.3 similarity
 
     # Mode activation entropy bonus (keep some exploration)
-    p = state.mode_activation / (state.mode_activation.sum() + 1e-8)
+    p = state['mode_activation'] / (state['mode_activation'].sum() + 1e-8)
     entropy = -jnp.sum(p * jnp.log(p + 1e-8))
     entropy_bonus = -0.001 * entropy  # negative = maximise entropy, but weak
 
@@ -270,7 +311,10 @@ def self_lattice_reg_loss(params, state: SelfState) -> jnp.ndarray:
 
 
 __all__ = [
+    'SelfStateDC',
     'SelfState',
+    'self_state_from_dc',
+    'self_state_to_dc',
     'init_self_params',
     'init_self_state',
     'reset_session_state',

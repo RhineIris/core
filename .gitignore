@@ -29,6 +29,7 @@ extracted/
 *.txt
 *.bin
 *.dat
+*.json
 
 # --- Generated output ---
 *.html
