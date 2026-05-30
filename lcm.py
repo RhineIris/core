@@ -1646,7 +1646,7 @@ class LCMInferEngine:
         """)
 
     def generate(self, prompt, max_new=128, temperature=0.7, top_k=50,
-                 bos_token=2, eos_token=3, use_loop=False, show_trace=False):
+                 bos_token=2, eos_token=3, use_loop=True, show_trace=False):
         encoding = self.tokenizer.encode(prompt)
         token_ids = encoding.ids
         if not token_ids or token_ids[0] != bos_token:
@@ -1886,8 +1886,8 @@ def main():
                    default=0.7, help="Sampling temperature (default 0.7)")
     p.add_argument("-t", "--trace", action="store_true",
                    help="Show cognitive trace per token")
-    p.add_argument("--loop", action="store_true",
-                   help="Use multi-step cognitive loop (slower but more refined)")
+    p.add_argument("--loop", action="store_true", default=True,
+                   help=argparse.SUPPRESS)
     p.add_argument("-A", "--show-arch", action="store_true",
                    help="Print architecture diagram and exit")
 
