@@ -375,26 +375,179 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
 # ─── Checkpoint ──────────────────────────────────────────────────────────────
 
+def _write_bin_header(buf, M, d, n_layers=1, cb_type=0):
+    """Append LCM binary codebook header to bytearray."""
+    import struct
+    magic = b"LCM_CB"
+    buf.extend(magic)
+    for v in [2, M, d, n_layers, cb_type, 0, 0, 0]:
+        buf.extend(struct.pack("<I", v))
+
+
+def _to_np(x):
+    """Convert jax array → numpy, no-op if already numpy."""
+    import numpy as _np
+    return _np.array(x) if hasattr(x, 'numpy') else x
+
+
 def save_cog_checkpoint(params, output_dir, step, self_state=None):
     """Save full checkpoint + export codebooks + W_out for C engine."""
+    import json, os, pickle, struct
+    import numpy as _np
+    from train.gvalue import make_global_value_vectors, GValueCodebook
+
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "codebooks"), exist_ok=True)
 
-    ckpt = jax.tree_util.tree_map(lambda x: np.array(x), params)
+    ckpt = jax.tree_util.tree_map(_to_np, params)
     with open(os.path.join(output_dir, "cog_params.pkl"), "wb") as f:
         pickle.dump({'params': ckpt, 'step': step, 'self_state': self_state}, f)
 
-    # Export flat codebook matrices as .bin
-    codebooks_flat = pack_codebooks_for_c(params)
-    bin_dir = os.path.join(output_dir, "codebooks")
-    for i, cb in enumerate(codebooks_flat):
-        np.array(cb, dtype=np.float32).tofile(os.path.join(bin_dir, f"codebook_{i}.bin"))
-    np.array(params['W_out'], dtype=np.float32).tofile(
-        os.path.join(bin_dir, "W_out.bin"))
+    # ── C推理引擎输出格式 ──────────────────────────────────────────────
 
-    size_mb = sum(os.path.getsize(os.path.join(bin_dir, f))
-                  for f in os.listdir(bin_dir)) / 1e6
-    print(f"[CKPT] Step {step}: codebooks + W_out ({size_mb:.1f} MB) → {bin_dir}/")
+    def _simvq_cb(simvq):
+        return _to_np(simvq['A']) @ _to_np(simvq['W'])
+
+    d = _to_np(params['W_out']).shape[0]
+    V = _to_np(params['W_out']).shape[1]
+
+    # config.json
+    enc = params.get('encoder', {})
+    cfg = {
+        'd_model': d, 'vocab_size': V, 'max_seq_len': 512, 'n_heads': 4,
+        'n_encoder_layers': len(enc.get('layers', [])) if enc else 2,
+        'n_lattices': 6,
+        'd_ff': int(1.5 * d),
+        'M_top': _to_np(params['hrq']['top']['A']).shape[0],
+        'M_fine': _to_np(params['hrq']['fine'][0]['A']).shape[0],
+        'n_hrq_layers': len(params['hrq']['fine']),
+        'M_sparse': _to_np(params['sparse']['C']).shape[0],
+        'M_lr': _to_np(params['lowrank']['A_V']).shape[0],
+        'M_man': _to_np(params['manifold']['C']).shape[0],
+        'M_bind': _to_np(params['binding']['key_cb'][0]['A']).shape[0],
+        'M_contrast': _to_np(params['contrast']['C_a'][0]['A']).shape[0],
+        'n_bind_layers': len(params['binding']['key_cb']),
+        'n_contrast_layers': len(params['contrast']['C_a']),
+        'n_lr_layers': 3, 'r_max': 8, 't_dim': 4,
+        'n_value_pairs': 4, 'M_danger': 256,
+        'n_self_codes': _to_np(params['self']['modes']).shape[0],
+        'max_inference_steps': 32, 'convergence_tol': 1e-3,
+        'entropy_threshold': 0.5,
+    }
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(cfg, f)
+
+    # encoder.bin
+    if enc:
+        parts = [_to_np(enc['embed']).ravel(), _to_np(enc['rel_bias']).ravel()]
+        for layer in enc['layers']:
+            for k in ['ln1_scale','ln1_bias','w_q','w_k','w_v','w_o',
+                       'ln2_scale','ln2_bias','w_1','w_2','w_3']:
+                parts.append(_to_np(layer[k]).ravel())
+        parts.append(_to_np(enc['q_pool']).ravel())
+        parts.append(_to_np(enc['w_proj']).ravel())
+        _np.concatenate(parts).astype(_np.float32).tofile(
+            os.path.join(output_dir, "encoder.bin"))
+    else:
+        # dummy encoder (random) — exists for compatibility
+        _np.random.seed(0)
+        dummy = _np.random.randn(1).astype(_np.float32)
+        dummy.tofile(os.path.join(output_dir, "encoder.bin"))
+
+    # decoder.bin (new format: gen_head)
+    gh = params.get('gen_head', {})
+    if gh:
+        parts = [_to_np(gh['w_embed']).ravel()]
+        for k in ['w_q','w_k','w_v','w_o']:
+            parts.append(_to_np(gh[k]).ravel())
+        parts.append(_to_np(gh['w_1']).ravel())
+        parts.append(_to_np(gh['w_2']).ravel())
+        parts.append(_to_np(gh['w_3']).ravel())
+        dec = _np.concatenate(parts).astype(_np.float32)
+    else:
+        dec = _to_np(params['W_out']).copy()  # fallback
+    dec.tofile(os.path.join(output_dir, "decoder.bin"))
+
+    # 导出所有 codebook .bin 文件（带 LCM_CB 头部）
+    codebooks_dir = os.path.join(output_dir, "codebooks")
+    cb_entries = []
+
+    # HRQ
+    cb_top = _simvq_cb(params['hrq']['top'])
+    _write_cb_bin(codebooks_dir, "hrq_codebook.bin", cb_top, 10)
+    for i, fb in enumerate(params['hrq']['fine']):
+        _write_cb_bin(codebooks_dir, f"hrq_fine_{i}.bin", _simvq_cb(fb), 10)
+
+    # Sparse
+    _write_cb_bin(codebooks_dir, "sparse_codebook.bin", _to_np(params['sparse']['C']), 11)
+
+    # LowRank
+    lr = params['lowrank']
+    V_lr = _to_np(lr['A_V']) @ _to_np(lr['W_V'])
+    lr_list = []
+    for u_k in lr['U']:
+        u = _to_np(u_k)
+        lr_list.append(u @ V_lr[:, :u.shape[-1]].T)
+    lr_flat = _np.concatenate([m.ravel() for m in lr_list])
+    lr_flat.tofile(os.path.join(codebooks_dir, "lowrank_codebook.bin"))
+
+    # Manifold
+    _write_cb_bin(codebooks_dir, "manifold_codebook.bin", _to_np(params['manifold']['C']), 13)
+
+    # Binding
+    for prefix, key in [('key','key_cb'), ('val','val_cb'), ('bind','bind_cb')]:
+        for i, cb in enumerate(params['binding'][key]):
+            _write_cb_bin(codebooks_dir, f"binding_{prefix}_{i}.bin", _simvq_cb(cb),
+                          14 if prefix == 'key' else 15 if prefix == 'val' else 16)
+
+    # Contrast
+    for prefix, key in [('a','C_a'), ('b','C_b')]:
+        for i, cb in enumerate(params['contrast'][key]):
+            _write_cb_bin(codebooks_dir, f"contrast_{prefix}_{i}.bin", _simvq_cb(cb), 17)
+
+    # tokenizer.json — 从 data/ 复制
+    import shutil
+    for cand in ['data/tokenizer.json', '../data/tokenizer.json']:
+        if os.path.exists(cand):
+            shutil.copy2(cand, os.path.join(output_dir, "tokenizer.json"))
+            break
+
+    # gvalue codebooks
+    try:
+        C_pos, C_neg = make_global_value_vectors(d)
+        GValueCodebook(C_pos, C_neg).save(output_dir)
+    except Exception:
+        pass
+
+    # 统计大小
+    total_bytes = 0
+    for root, dirs, files in os.walk(output_dir):
+        for f in files:
+            if f.endswith('.bin') or f.endswith('.json') or f.endswith('.pkl'):
+                total_bytes += os.path.getsize(os.path.join(root, f))
+    print(f"[CKPT] Step {step}: inference format → {output_dir}/ ({total_bytes/1e6:.0f} MB)")
+
+
+def _write_cb_bin(dir_path, filename, mat, cb_type):
+    """Write numpy matrix as LCM binary codebook file with header."""
+    import struct
+    buf = bytearray(36)
+    M, d = mat.shape
+    buf[0:6] = b"LCM_CB"
+    struct.pack_into("<I", buf, 6, 2)    # version
+    struct.pack_into("<I", buf, 10, M)    # n_codes
+    struct.pack_into("<I", buf, 14, d)    # dim
+    struct.pack_into("<I", buf, 18, 1)    # n_layers
+    buf[22] = cb_type
+    buf[23] = 0
+    struct.pack_into("<I", buf, 24, 0)    # c
+    crc = sum(buf[:28]) & 0xFFFFFFFF
+    struct.pack_into("<I", buf, 28, crc)
+    struct.pack_into("<I", buf, 32, 0)    # reserved
+    path = os.path.join(dir_path, filename)
+    with open(path, "wb") as f:
+        f.write(buf)
+        mat.astype(_np.float32).tofile(f)
 
 
 def load_cog_checkpoint(path, d_model=None, n_self_codes=64):

@@ -1994,6 +1994,12 @@ def main():
     pch.add_argument("-o", "--output", default="metrics.html",
                      help="Output HTML path (default: metrics.html)")
 
+    # ── export subcommand ──────────────────────────────────────────────
+    pe = sub.add_parser("export", help="Export cog_train checkpoint → C inference engine format")
+    pe.add_argument("ckpt_dir", help="Path to cog_train checkpoint directory (e.g. checkpoints/cog/step_010000)")
+    pe.add_argument("-o", "--out", default=None, help="Output directory (default: ckpt_dir + _infer)")
+    pe.add_argument("--data-dir", default="data", help="Data directory (for tokenizer.json)")
+
     # ── build subcommand ───────────────────────────────────────────────
     pb = sub.add_parser("build", help="Compile Cython acceleration extensions (.pyx → .so)")
     pb.add_argument("--inplace", action="store_true", default=True,
@@ -2012,6 +2018,11 @@ def main():
         return
     elif args.mode == "build":
         _build_cython(d_model=getattr(args, 'd_model', None) or getattr(args, 'dm', None) or 256)
+        return
+    elif args.mode == "export":
+        from train.export_cog_ckpt import export
+        out = args.out or args.ckpt_dir.rstrip("/") + "_infer"
+        export(args.ckpt_dir, out, args.data_dir)
         return
     elif args.show_arch:
         LCMInferEngine.print_architecture()
