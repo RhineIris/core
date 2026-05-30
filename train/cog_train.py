@@ -15,8 +15,8 @@ Usage:
 """
 import os
 import pickle
+import sys
 import time
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -215,56 +215,55 @@ def make_train_step(cfg, optimizer):
     Self-lattice provides internal state machine (mode selection, self output).
     """
 
-    @partial(jax.jit, static_argnums=(4,))
-    def train_step(params, opt_state, batch, lr, step, self_state=None):
+    @jax.jit
+    def train_step(params, opt_state, batch, lr, rng, self_state=None):
         inputs, targets = batch
         B, N = inputs.shape
 
         def loss_fn(p):
-            z = encoder_forward(p['encoder'], inputs, cfg.n_heads)
-            z_conscious = jnp.mean(z.reshape(-1, z.shape[-1]), axis=0)
-
+            z = encoder_forward(p['encoder'], inputs, cfg.n_heads)  # (B, d)
             codebooks = pack_codebooks_for_c(p)
-            z_qs, diffs, entropies = cog_loop_scan(
-                z_conscious, codebooks,
+
+            # ── Batch-aware cognitive loop (vmap over batch) ────────────
+            _cog = lambda zi: cog_loop_scan(
+                zi, codebooks,
                 max_steps=cfg.max_inference_steps,
-                thresholds=None,
-                tau=0.1)
-            # z_qs: (max_steps, d), diffs: (max_steps,), entropies: (max_steps,)
+                thresholds=None, tau=0.1)
+            z_qs, diffs, entropies = jax.vmap(_cog, in_axes=0)(z)
+            # z_qs: (B, max_steps, d), diffs: (B, max_steps)
 
             # ── Self lattice ────────────────────────────────────────────
-            # Use the final conscious state to drive self dynamics
-            rng_self = jax.random.PRNGKey(step)
+            z_final_mean = z_qs[:, -1, :].mean(axis=0)  # (d,)
+            rng_self = rng
             self_state_out = None
             loss_self = jnp.array(0.0)
             if self_state is not None and 'self' in p:
                 o_self, self_state_out, world_dev = self_lattice_forward(
-                    p['self'], self_state, z=z_qs[-1][None, :],
+                    p['self'], self_state, z=z_final_mean[None, :],
                     rng=rng_self, training=True)
                 loss_self = self_lattice_reg_loss(p['self'], self_state_out)
 
-            # Passive channel: transparent introspection at every macro step
-            passive_losses = []
-            for i in range(cfg.max_inference_steps):
-                p_logits = z_qs[i] @ p['W_out']  # (V,) — cheap matmul
-                passive_losses.append(passive_loss(p_logits, targets[0, 0]))
-            step_weights = jnp.arange(
-                1, cfg.max_inference_steps + 1, dtype=jnp.float32)
-            p_loss = jnp.sum(jnp.array(passive_losses) * step_weights) / jnp.sum(step_weights)
+            # ── Passive channel: (B, max_steps, V) logits → (B,) target ─
+            p_logits = jnp.einsum('bsd,dv->bsv', z_qs, p['W_out'])  # (B, S, V)
+            p_target = targets[:, 0]                                  # (B,)
+            # CE over all steps × batch — mean, not weighted sum
+            p_loss = optax.softmax_cross_entropy_with_integer_labels(
+                p_logits.reshape(-1, p_logits.shape[-1]),
+                p_target[:, None].repeat(cfg.max_inference_steps, axis=1).reshape(-1),
+            ).mean()
 
-            # Active channel: fluent language skill at final step only (GPU memory)
-            a_logits = decoder_forward(
-                p['gen_head'], z_qs[-1], inputs, p['w_start'])  # (B, N, V)
+            # ── Active channel: vmap gen_head over batch ────────────────
+            _decode = lambda z_i, x_i: decoder_forward(
+                p['gen_head'], z_i, x_i[None, :], p['w_start'])[0]
+            a_logits = jax.vmap(_decode, in_axes=(0, 0))(z_qs[:, -1, :], inputs)
             a_loss = active_loss(a_logits, targets)
 
-            # Combined loss
-            loss = p_loss + a_loss + loss_self
+            # Convergence bonus (batch-mean)
+            conv = (diffs[:, -1] < cfg.convergence_tol) & (entropies[:, -1] < cfg.entropy_threshold)
+            n_steps = jnp.argmax((diffs < cfg.convergence_tol).astype(jnp.float32), axis=-1) + 1
 
-            # Convergence bonus: reward efficient thinking
-            converged = (diffs[-1] < cfg.convergence_tol) & (entropies[-1] < cfg.entropy_threshold)
-            n_steps = jnp.argmax(diffs < cfg.convergence_tol) + 1
-            loss = loss + jnp.where(converged,
-                                    -0.001 * jnp.log(n_steps + 1e-8), 0.0)
+            loss = p_loss + a_loss + loss_self + jnp.mean(
+                jnp.where(conv, -0.001 * jnp.log(n_steps.astype(jnp.float32) + 1e-8), 0.0))
 
             aux_out = {'self_state': self_state_out, 'loss_self': loss_self}
             return loss, aux_out
@@ -326,12 +325,23 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     start_time = time.time()
     pbar = tqdm(total=steps, desc="cog training", unit="step")
 
+    import signal as _signal
+
+    def _handler(sig, frame):
+        print(f"\n[COG] Interrupt at step {step}, saving checkpoint...")
+        save_cog_checkpoint(params, output_dir, step, self_state=self_state)
+        print(f"[COG] Saved → {output_dir}/cog_params.pkl")
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGINT, _handler)
+
     for step in range(steps):
         batch = next(data_iter)
         current_lr = schedule(step)
+        rng, step_rng = jax.random.split(rng)
 
         params, opt_state, loss_val, aux_out = train_step(
-            params, opt_state, batch, current_lr, step, self_state=self_state)
+            params, opt_state, batch, current_lr, step_rng, self_state=self_state)
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
