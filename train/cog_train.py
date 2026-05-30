@@ -321,6 +321,18 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
     print()
 
+    import numpy as _np_np
+    V = cfg.vocab_size
+    _LN_V = float(_np_np.log(V))  # passive random baseline ≈ 10.31
+    _ACTIVE_FLOOR = 5.06           # Stage 1 gen_head final loss
+    _LOSS_FLOOR = _ACTIVE_FLOOR    # total lower bound (passive → 0, active → floor)
+
+    print(f"[COG] Info theory bounds:")
+    print(f"      passive random: ln(V) = {_LN_V:.2f}")
+    print(f"      active  floor:  Stage 1 baseline = {_ACTIVE_FLOOR:.2f}")
+    print(f"      total   floor:  {_LOSS_FLOOR:.2f}  (gap = loss - {_LOSS_FLOOR:.2f})")
+    print()
+
     running_loss = 0.0
     start_time = time.time()
     pbar = tqdm(total=steps, desc="cog training", unit="step")
@@ -354,7 +366,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             elapsed = time.time() - start_time
             tok_s = batch_size * seq_len * log_every / elapsed
             loss_self = float(aux_out.get('loss_self', 0.0))
-            parts = [f"  step {step:>6d} | loss={avg_loss:.4f}"]
+            gap = avg_loss - _LOSS_FLOOR
+            parts = [f"  step {step:>6d} | loss={avg_loss:.4f}  gap={gap:.2f}"]
             if loss_self > 0:
                 parts.append(f"self={loss_self:.6f}")
             parts.append(f"lr={current_lr:.2e} | {tok_s:.0f} tok/s")
