@@ -388,13 +388,44 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
 # ─── Checkpoint ──────────────────────────────────────────────────────────────
 
-def _write_bin_header(buf, M, d, n_layers=1, cb_type=0):
-    """Append LCM binary codebook header to bytearray."""
+# 24-byte header format (matches checkpoint.py + lcm.py inference engine)
+_CB_HEADER_FMT = '<iiiifI'
+
+
+def _pack_cb_header(M, d, n_layers, cb_type=1, curvature=1.0):
     import struct
-    magic = b"LCM_CB"
-    buf.extend(magic)
-    for v in [2, M, d, n_layers, cb_type, 0, 0, 0]:
-        buf.extend(struct.pack("<I", v))
+    return struct.pack(_CB_HEADER_FMT, int(M), int(d), int(n_layers), int(cb_type), float(curvature), 0)
+
+
+def _write_cb_bin(dir_path, filename, mat, cb_type):
+    """Write single codebook matrix with 24-byte header."""
+    import struct, zlib, os
+    import numpy as _np
+    mat = _np.asarray(mat, dtype=_np.float32)
+    M, d = mat.shape
+    data_bytes = mat.tobytes()
+    crc = zlib.crc32(data_bytes) & 0xFFFFFFFF
+    hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), 1, int(cb_type), 1.0, crc)
+    path = os.path.join(dir_path, filename)
+    with open(path, 'wb') as f:
+        f.write(hdr)
+        f.write(data_bytes)
+
+
+def _write_flat_cb(dir_path, filename, arrays, cb_type=1):
+    """Write header + multiple arrays as concatenated data bytes."""
+    import struct, zlib, os
+    import numpy as _np
+    arrays = [_np.asarray(a, dtype=_np.float32) for a in arrays]
+    M = arrays[0].shape[0]
+    d = arrays[0].shape[1]
+    data_bytes = b''.join(a.tobytes() for a in arrays)
+    crc = zlib.crc32(data_bytes) & 0xFFFFFFFF
+    hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), len(arrays), int(cb_type), 1.0, crc)
+    path = os.path.join(dir_path, filename)
+    with open(path, 'wb') as f:
+        f.write(hdr)
+        f.write(data_bytes)
 
 
 def _to_np(x):
@@ -407,10 +438,10 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
     """Save full checkpoint + export codebooks + W_out for C engine."""
     import json, os, pickle, struct
     import numpy as _np
-    from train.gvalue import make_global_value_vectors, GValueCodebook
+    from train.gvalue import make_global_value_vectors
 
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "codebooks"), exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     ckpt = jax.tree_util.tree_map(_to_np, params)
     with open(os.path.join(output_dir, "cog_params.pkl"), "wb") as f:
@@ -482,41 +513,51 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
     dec.tofile(os.path.join(output_dir, "decoder.bin"))
 
     # 导出所有 codebook .bin 文件（带 LCM_CB 头部）
-    codebooks_dir = os.path.join(output_dir, "codebooks")
+    codebooks_dir = output_dir
     cb_entries = []
 
-    # HRQ
-    cb_top = _simvq_cb(params['hrq']['top'])
-    _write_cb_bin(codebooks_dir, "hrq_codebook.bin", cb_top, 10)
-    for i, fb in enumerate(params['hrq']['fine']):
-        _write_cb_bin(codebooks_dir, f"hrq_fine_{i}.bin", _simvq_cb(fb), 10)
+    # HRQ: all layers stacked in one file (header + all layer data)
+    hrq_layers = [_simvq_cb(params['hrq']['top'])]
+    for fb in params['hrq'].get('fine', []):
+        hrq_layers.append(_simvq_cb(fb))
+    _write_flat_cb(codebooks_dir, "hrq_codebook.bin", hrq_layers, 1)
 
     # Sparse
     _write_cb_bin(codebooks_dir, "sparse_codebook.bin", _to_np(params['sparse']['C']), 11)
 
-    # LowRank
+    # LowRank: U_0..U_k + V (raw U matrices, not reconstructed)
     lr = params['lowrank']
     V_lr = _to_np(lr['A_V']) @ _to_np(lr['W_V'])
-    lr_list = []
+    parts_lr = []
     for u_k in lr['U']:
-        u = _to_np(u_k)
-        lr_list.append(u @ V_lr[:, :u.shape[-1]].T)
-    lr_flat = _np.concatenate([m.ravel() for m in lr_list])
-    lr_flat.tofile(os.path.join(codebooks_dir, "lowrank_codebook.bin"))
+        parts_lr.append(_to_np(u_k).ravel())
+    parts_lr.append(V_lr.ravel())
+    _np.concatenate(parts_lr).astype(_np.float32).tofile(
+        os.path.join(codebooks_dir, "lowrank_codebook.bin"))
 
-    # Manifold
-    _write_cb_bin(codebooks_dir, "manifold_codebook.bin", _to_np(params['manifold']['C']), 13)
+    # Manifold: header + C + T
+    C_m = _to_np(params['manifold']['C'])
+    T_m = _to_np(params['manifold']['T'].reshape(C_m.shape[0], -1))
+    _write_flat_cb(codebooks_dir, "manifold_codebook.bin", [C_m, T_m], 2)
 
-    # Binding
-    for prefix, key in [('key','key_cb'), ('val','val_cb'), ('bind','bind_cb')]:
-        for i, cb in enumerate(params['binding'][key]):
-            _write_cb_bin(codebooks_dir, f"binding_{prefix}_{i}.bin", _simvq_cb(cb),
-                          14 if prefix == 'key' else 15 if prefix == 'val' else 16)
+    # Binding: single flat file (key_0, val_0, bind_0, key_1, ...)
+    bind = params['binding']
+    parts_bind = []
+    for l in range(len(bind.get('key_cb', []))):
+        for k in ['key_cb', 'val_cb', 'bind_cb']:
+            parts_bind.append(_simvq_cb(bind[k][l]).ravel())
+    _np.concatenate(parts_bind).astype(_np.float32).tofile(
+        os.path.join(codebooks_dir, "bind_codebook.bin"))
 
-    # Contrast
-    for prefix, key in [('a','C_a'), ('b','C_b')]:
-        for i, cb in enumerate(params['contrast'][key]):
-            _write_cb_bin(codebooks_dir, f"contrast_{prefix}_{i}.bin", _simvq_cb(cb), 17)
+    # Contrast: single flat file (C_a_0..C_a_n, C_b_0..C_b_n)
+    contrast = params['contrast']
+    parts_ct = []
+    for ca in contrast.get('C_a', []):
+        parts_ct.append(_simvq_cb(ca).ravel())
+    for cb in contrast.get('C_b', []):
+        parts_ct.append(_simvq_cb(cb).ravel())
+    _np.concatenate(parts_ct).astype(_np.float32).tofile(
+        os.path.join(codebooks_dir, "contrast_codebook.bin"))
 
     # tokenizer.json — 从 data/ 复制
     import shutil
@@ -527,8 +568,39 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
 
     # gvalue codebooks
     try:
+        import hashlib as _hl
         C_pos, C_neg = make_global_value_vectors(d)
-        GValueCodebook(C_pos, C_neg).save(output_dir)
+        C_p = _to_np(C_pos)
+        C_n = _to_np(C_neg)
+        _hdr = bytearray(36)
+        _hdr[0:6] = b"LCM_CB"
+        struct.pack_into("<I", _hdr, 6, 2)
+        struct.pack_into("<I", _hdr, 10, C_p.shape[0])
+        struct.pack_into("<I", _hdr, 14, d)
+        struct.pack_into("<I", _hdr, 18, 1)
+        _hdr[22] = 20
+        struct.pack_into("<I", _hdr, 24, 0)
+        struct.pack_into("<I", _hdr, 28, sum(_hdr[:28]) & 0xFFFFFFFF)
+        _data = C_p.tobytes() + C_n.tobytes()
+        with open(os.path.join(output_dir, "gvalue_codebook.bin"), "wb") as _f:
+            _f.write(_hdr)
+            _f.write(_data)
+            _f.write(_hl.sha256(_data).digest())
+    except Exception as e:
+        print(f"[CKPT] gvalue write skipped: {e}")
+    # danger codebook (dummy)
+    try:
+        M_d = cfg.get("M_danger", 256)
+        danger_t = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
+        danger_n = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
+        _data_d = danger_t.tobytes() + danger_n.tobytes()
+        _sha_d = _hl.sha256(_data_d).digest()
+        _crc_d = zlib.crc32(_data_d) & 0xFFFFFFFF
+        _hdr_d = struct.pack("<iiiifI", int(M_d), int(d), 1, 2, 1.0, _crc_d)
+        with open(os.path.join(output_dir, "danger_codebook.bin"), "wb") as _f:
+            _f.write(_hdr_d)
+            _f.write(_data_d)
+            _f.write(_sha_d)
     except Exception:
         pass
 

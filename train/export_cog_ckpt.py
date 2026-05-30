@@ -1,33 +1,36 @@
 """Export cog_train checkpoint → C inference engine format (encoder.bin, decoder.bin, codebooks)."""
 
+import hashlib
 import json
 import os
 import pickle
 import struct
 import sys
+import zlib
 
 import numpy as np
 
-LCM_MAGIC = b"LCM_CB"
-LCM_VERSION = 2
+# Match checkpoint.py 24-byte header format: <iiiifI = M,d,n_layers,type,curvature,crc
+HEADER_FMT = '<iiiifI'
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 
-def _write_bin_header(path, M, d, n_layers, cb_type, c=0):
-    """Write binary header for codebook .bin files."""
-    buf = bytearray(36)
-    buf[0:6] = LCM_MAGIC
-    struct.pack_into("<I", buf, 6, LCM_VERSION)
-    struct.pack_into("<I", buf, 10, M)
-    struct.pack_into("<I", buf, 14, d)
-    struct.pack_into("<I", buf, 18, n_layers)
-    buf[22] = cb_type
-    buf[23] = 0
-    struct.pack_into("<I", buf, 24, c)
-    crc = sum(buf[:28]) & 0xFFFFFFFF
-    struct.pack_into("<I", buf, 28, crc)
-    struct.pack_into("<I", buf, 32, 0)  # reserved
-    with open(path, "wb") as f:
-        f.write(buf)
+def _pack_header(M, d, n_layers, cb_type, curvature=1.0):
+    return struct.pack(HEADER_FMT, int(M), int(d), int(n_layers), int(cb_type), float(curvature), 0)
+
+
+def _write_cb(path, arrays, cb_type=1, curvature=1.0):
+    """Write codebook .bin file: 24-byte header + data + CRC."""
+    arrays = [np.asarray(a, dtype=np.float32) for a in arrays]
+    M = arrays[0].shape[0]
+    d = arrays[0].shape[1]
+    n_layers = len(arrays)
+    data_bytes = b''.join(a.tobytes() for a in arrays)
+    crc = zlib.crc32(data_bytes) & 0xFFFFFFFF
+    hdr = struct.pack(HEADER_FMT, int(M), int(d), int(n_layers), int(cb_type), float(curvature), crc)
+    with open(path, 'wb') as f:
+        f.write(hdr)
+        f.write(data_bytes)
 
 
 def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
@@ -195,65 +198,63 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
     print(f"[EXPORT] decoder.bin ({decoder_flat.nbytes / 1e6:.1f} MB) → {out_dir}/")
 
     # ── codebooks ──────────────────────────────────────────────────────
-    codebooks_dir = os.path.join(out_dir, "codebooks")
-    os.makedirs(codebooks_dir, exist_ok=True)
+    def _simvq(simvq):
+        return _to_np(simvq['A']) @ _to_np(simvq['W'])
 
-    # Build list of (filename_prefix, cb_type, matrix) entries
-    cb_entries = []
+    # HRQ: one flat file, all layers concat (header + data)
+    hrq = params.get('hrq', {})
+    if hrq and 'top' in hrq:
+        layers_hrq = [_simvq(hrq['top'])]
+        for fb in hrq.get('fine', []):
+            layers_hrq.append(_simvq(fb))
+        _write_cb(os.path.join(out_dir, "hrq_codebook.bin"), layers_hrq, cb_type=1)
 
-    def _simvq_cb(simvq):
-        """Extract actual codebook: A @ W."""
-        A = _to_np(simvq["A"])
-        W = _to_np(simvq["W"])
-        return A @ W
+    # Sparse: header + C
+    sparse = params.get('sparse', {})
+    if sparse and 'C' in sparse:
+        _write_cb(os.path.join(out_dir, "sparse_codebook.bin"), [_to_np(sparse['C'])], cb_type=1)
 
-    # HRQ: top + fine per layer
-    hrq = params.get("hrq", {})
-    if "top" in hrq:
-        cb_top = _simvq_cb(hrq["top"])
-        cb_entries.append((f"hrq_codebook", 10, cb_top))  # cb_type 10 = HRQ
+    # LowRank: flat file (U_0..U_k + V), no header
+    lr = params.get('lowrank', {})
+    if lr and 'A_V' in lr and 'W_V' in lr and 'U' in lr:
+        V_lr = _to_np(lr['A_V']) @ _to_np(lr['W_V'])
+        parts_lr = []
+        for U in lr['U']:
+            parts_lr.append(_to_np(U).ravel())  # U itself (M_lr, r_k) not the product
+        parts_lr.append(V_lr.ravel())           # (d, d)
+        np.concatenate(parts_lr).astype(np.float32).tofile(
+            os.path.join(out_dir, "lowrank_codebook.bin"))
 
-    # Sparse
-    sparse = params.get("sparse", {})
-    if "C" in sparse:
-        cb_entries.append(("sparse_codebook", 11, _to_np(sparse["C"])))
+    # Manifold: header + C + T
+    manifold = params.get('manifold', {})
+    if manifold and 'C' in manifold and 'T' in manifold:
+        C_m = _to_np(manifold['C'])
+        T_m = _to_np(manifold['T'].reshape(C_m.shape[0], -1))
+        _write_cb(os.path.join(out_dir, "manifold_codebook.bin"), [C_m, T_m], cb_type=2)
 
-    # LowRank
-    lr = params.get("lowrank", {})
-    if "A_V" in lr and "W_V" in lr and "U" in lr:
-        V = _to_np(lr["A_V"]) @ _to_np(lr["W_V"])
-        lr_matrices = [_to_np(u) @ V[:, :_to_np(u).shape[-1]].T for u in lr["U"]]
-        # If multiple ranks, concatenate
-        lr_flat = np.concatenate([m.ravel() for m in lr_matrices])
-        # Write as single flat file for now
-        lr_flat.tofile(os.path.join(codebooks_dir, "lowrank_codebook.bin"))
-        # Write header manually
-        Mc = lr_matrices[0].shape[0]
-        d = lr_matrices[0].shape[1]
-        _write_bin_header(os.path.join(codebooks_dir, "lowrank_codebook.bin"), Mc, d, len(lr_matrices), 12)
+    # Binding: single flat file (key_0, val_0, bind_0, key_1, ...)
+    binding = params.get('binding', {})
+    if binding and 'key_cb' in binding:
+        parts_bind = []
+        for l in range(len(binding['key_cb'])):
+            for cb_type_name in ['key_cb', 'val_cb', 'bind_cb']:
+                C = _simvq(binding[cb_type_name][l])
+                parts_bind.append(C.ravel())
+        np.concatenate(parts_bind).astype(np.float32).tofile(
+            os.path.join(out_dir, "bind_codebook.bin"))
 
-    # Manifold
-    manifold = params.get("manifold", {})
-    if "C" in manifold:
-        cb_entries.append(("manifold_codebook", 13, _to_np(manifold["C"])))
+    # Contrast: single flat file (C_a_0..C_a_n, C_b_0..C_b_n)
+    contrast = params.get('contrast', {})
+    if contrast and 'C_a' in contrast:
+        parts_ct = []
+        for ca in contrast['C_a']:
+            parts_ct.append(_simvq(ca).ravel())
+        for cb in contrast['C_b']:
+            parts_ct.append(_simvq(cb).ravel())
+        np.concatenate(parts_ct).astype(np.float32).tofile(
+            os.path.join(out_dir, "contrast_codebook.bin"))
 
-    # Binding: key, value, bind per layer
-    binding = params.get("binding", {})
-    for key_list, cb_type in [("key_cb", 14), ("val_cb", 15), ("bind_cb", 16)]:
-        if key_list in binding:
-            for i, cb in enumerate(binding[key_list]):
-                name = f"binding_{key_list.split('_')[0]}_{i}.bin"
-                mat = _simvq_cb(cb)
-                mat.astype(np.float32).tofile(os.path.join(codebooks_dir, name))
-                _write_bin_header(os.path.join(codebooks_dir, name), mat.shape[0], mat.shape[1], 1, cb_type)
-
-    # Write codebooks with headers
-    for prefix, cb_type, mat in cb_entries:
-        path = os.path.join(codebooks_dir, f"{prefix}.bin")
-        mat.astype(np.float32).tofile(path)
-        _write_bin_header(path, mat.shape[0], mat.shape[1], 1, cb_type)
-
-    print(f"[EXPORT] Codebooks → {codebooks_dir}/")
+    print(f"[EXPORT] Codebooks → {out_dir}/")
 
     # ── tokenizer.json (copy) ──────────────────────────────────────────
     import shutil
@@ -266,10 +267,33 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
         print(f"[EXPORT] WARN: tokenizer.json not found at {tok_src}")
 
     # ── gvalue codebooks ───────────────────────────────────────────────
-    from train.gvalue import make_global_value_vectors, GValueCodebook
+    from train.gvalue import make_global_value_vectors
     C_pos, C_neg = make_global_value_vectors(d_model)
-    gv = GValueCodebook(C_pos, C_neg)
-    gv.save(out_dir)
+    C_p = np.asarray(C_pos, dtype=np.float32) if hasattr(C_pos, 'numpy') else np.array(C_pos, dtype=np.float32)
+    C_n = np.asarray(C_neg, dtype=np.float32) if hasattr(C_neg, 'numpy') else np.array(C_neg, dtype=np.float32)
+    data_gv = C_p.tobytes() + C_n.tobytes()
+    sha_gv = hashlib.sha256(data_gv).digest()
+    M_gv = C_p.shape[0]
+    crc_gv = zlib.crc32(data_gv) & 0xFFFFFFFF
+    hdr_gv = struct.pack(HEADER_FMT, int(M_gv), int(d_model), 1, 2, 1.0, crc_gv)
+    with open(os.path.join(out_dir, "gvalue_codebook.bin"), "wb") as f:
+        f.write(hdr_gv)
+        f.write(data_gv)
+        f.write(sha_gv)
+    print(f"[EXPORT] gvalue_codebook.bin → {out_dir}/")
+
+    # danger codebook (dummy)
+    M_danger = cfg.get('M_danger', 256)
+    danger_t = np.random.randn(M_danger, d_model).astype(np.float32) * 0.02
+    danger_n = np.random.randn(M_danger, d_model).astype(np.float32) * 0.02
+    data_danger = danger_t.tobytes() + danger_n.tobytes()
+    sha_danger = hashlib.sha256(data_danger).digest()
+    crc_danger = zlib.crc32(data_danger) & 0xFFFFFFFF
+    hdr_danger = struct.pack(HEADER_FMT, int(M_danger), int(d_model), 1, 2, 1.0, crc_danger)
+    with open(os.path.join(out_dir, 'danger_codebook.bin'), 'wb') as f:
+        f.write(hdr_danger)
+        f.write(data_danger)
+        f.write(sha_danger)
 
     print(f"[EXPORT] Done → {out_dir}/")
 

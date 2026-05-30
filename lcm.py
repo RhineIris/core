@@ -18,26 +18,29 @@ Usage:
 """
 
 import argparse
+import ctypes
 import json
 import os
 import re
 import select
-import sys
 import signal
+import struct
+import sys
 import time
 
 os.environ.setdefault("JAX_SKIP_CUDA_CONSTRAINTS_CHECK", "1")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+import numpy as np
+from tqdm import tqdm
+
 try:
     import jax
     import jax.numpy as jnp
-    import numpy as np
     _HAS_JAX = True
 except ImportError:
     _HAS_JAX = False
     jnp = None
-    np = None
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -1542,7 +1545,6 @@ class LCMInferEngine:
                   f"{'YES' if t['has_conflict'] else 'no':>8}")
         print("-" * len(hdr))
 
-    @staticmethod
     def enable_prediction(self, cache_capacity=2048, reflect_interval=1000):
         """Enable the prediction cache system.
 
@@ -1902,7 +1904,7 @@ def main():
                    default=True, help="Enable long-term narrative")
     p.add_argument("--no-lt", dest="lt_enabled", action="store_false",
                    help="Disable long-term narrative")
-    p.add_argument("--lt-max", type=int, default=10000,
+    p.add_argument("--lt-max", type=int, default=10000, dest='lt_max_records',
                    help="Max long-term records (default 10000)")
     p.add_argument("--obs-summary", action="store_true",
                    help="Print observability summary after generation")
