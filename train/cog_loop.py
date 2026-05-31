@@ -75,12 +75,12 @@ def soft_retrieve(z, codebook, tau=0.1):
     dists = jnp.sum((z[None, :] - codebook) ** 2, axis=-1)  # (K,)
     d_min = jnp.min(dists)
     idx = jnp.argmin(dists)
-    # Straight-through: hard assignment forward, soft gradients backward
+    # Straight-through: hard forward, soft backward
     soft_idx = jax.nn.softmax(-dists / tau)
-    retrieved = codebook[idx]
-    # STE: use hard retrieved for forward, attach soft gradients
-    return retrieved + tau * jnp.sum(soft_idx[:, None] * codebook, axis=0) \
-           - tau * jnp.sum(soft_idx[:, None] * jax.lax.stop_gradient(codebook), axis=0), d_min, idx
+    hard = codebook[idx]
+    soft_avg = jnp.sum(soft_idx[:, None] * codebook, axis=0)
+    # STE: forward=hard, backward=soft gradients
+    return hard + soft_avg - jax.lax.stop_gradient(soft_avg), d_min, idx
 
 
 # ─── DAG operations (JIT-safe: always retrieve all, mask inactives) ──────────
@@ -116,10 +116,8 @@ def dag_fuse(z, codebooks, thresholds, tau=0.1, eps=1e-8):
     z_all = jnp.stack(embs)    # (n_lattices, d)
     d_all = jnp.stack(dists)   # (n_lattices,)
 
-    # Threshold mask — zero out inactive
-    thr = jnp.array(thresholds)
-    active = d_all < thr
-    weights = jnp.where(active, 1.0 / (d_all + eps), 0.0)
+    # Reciprocal-distance weights (all codebooks contribute, no hard threshold)
+    weights = 1.0 / (d_all + eps)
     w_sum = jnp.sum(weights) + eps
     weights = weights / w_sum
 

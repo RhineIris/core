@@ -224,11 +224,37 @@ def make_train_step(cfg, optimizer):
             z = encoder_forward(p['encoder'], inputs, cfg.n_heads)  # (B, d)
             codebooks = pack_codebooks_for_c(p)
 
+            # ── Normalise encoder output to codebook scale ────────────────
+            # Encoder initialisation is unscaled (norm ~14) while codebook
+            # entries live on the unit sphere (norm ~1.4).  Raw Euclidean
+            # distance in the cognitive loop is dominated by scale mismatch,
+            # not semantics.  We project z onto the codebook surface so that
+            # soft_retrieve measures directional similarity.
+            cb_mean_norm = jnp.sqrt(sum(
+                jnp.mean(jnp.sum(cb ** 2, axis=-1)) for cb in codebooks
+            ) / len(codebooks))
+            z_scale = jnp.sqrt(jnp.mean(jnp.sum(z ** 2, axis=-1)))
+            z = z * (cb_mean_norm / (z_scale + 1e-8))  # (B, d)
+
+            # ── Adaptive tau: prevent softmax underflow in float32 ──────────
+            # exp(-x) underflows in float32 when x > ~88.  We need
+            # -dist²/(d_model * tau) > -88 so the nearest entry gets
+            # non-zero gradient.  Compute tau from actual distances.
+            # With z norm and cb entries ≈ 1-2, median dist² ≈ 2-8.
+            # We target tau such that -dist²/tau ≈ -20 (safe zone).
+            sample_cb = codebooks[0]
+            z_sq = jnp.mean(jnp.sum(z ** 2, axis=-1))  # scalar
+            cb_sq = jnp.mean(jnp.sum(sample_cb ** 2, axis=-1))
+            median_dist2_est = z_sq + cb_sq  # E[||z - cb||²] ≈ ||z||² + ||cb||²
+            tau_adaptive = median_dist2_est / 20.0
+            tau_adaptive = jnp.clip(tau_adaptive, 0.1, 10.0)
+
             # ── Batch-aware cognitive loop (vmap over batch) ────────────
+            _tau = tau_adaptive
             _cog = lambda zi: cog_loop_scan(
                 zi, codebooks,
                 max_steps=cfg.max_inference_steps,
-                thresholds=None, tau=0.1)
+                thresholds=None, tau=_tau)
             z_qs, diffs, entropies = jax.vmap(_cog, in_axes=0)(z)
             # z_qs: (B, max_steps, d), diffs: (B, max_steps)
 

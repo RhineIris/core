@@ -1429,8 +1429,17 @@ class LCMInferEngine:
     def _ptr(self, arr):
         return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
+    def _normalise_codebook_scale(self, z):
+        """Scale z to match codebook entry norms so distance ≈ semantics."""
+        hrq = self.hrq_C.reshape(-1, self.d)
+        cb_mean_norm = float(np.sqrt(np.mean(np.sum(hrq ** 2, axis=-1))))
+        z_norm = float(np.linalg.norm(z))
+        if z_norm > 1e-8:
+            z = z * (cb_mean_norm / z_norm)
+        return z
+
     def cognitive_step(self, z):
-        z = np.ascontiguousarray(z, dtype=np.float32)
+        z = self._normalise_codebook_scale(np.ascontiguousarray(z, dtype=np.float32))
         z_out = np.zeros(self.d, dtype=np.float32)
         d = ctypes.c_int(self.d)
         ret = self.lib.lcm_infer_step(
@@ -1477,7 +1486,7 @@ class LCMInferEngine:
         modulated_max = max_steps + int(round(explore_m * max_steps))
         modulated_max = int(np.clip(modulated_max, 4, 64))
 
-        z = np.ascontiguousarray(z, dtype=np.float32)
+        z = self._normalise_codebook_scale(np.ascontiguousarray(z, dtype=np.float32))
         z_out = np.zeros(self.d, dtype=np.float32)
         d = ctypes.c_int(self.d)
         gv_n = self.gv_n if use_safety else 0
