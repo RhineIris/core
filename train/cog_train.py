@@ -35,15 +35,62 @@ from train.self_lattice import (
     self_lattice_reg_loss,
 )
 from train.cog_loop import cog_loop_scan
+from train.model import forward as std_forward
+from train.losses import compute_vq_loss
+from train.lattices import contrast_info_nce_loss
+
+
+# ─── Load Stage 2 memory checkpoint ─────────────────────────────────────────
+
+def load_stage2_params(resume, cfg, rng):
+    """Load encoder + all codebooks + gen_head from Stage 2 checkpoint.
+
+    Uses checkpoint.load_checkpoint to read .bin files.
+    Self-state is re-initialised (not persisted in .bin format).
+
+    Returns:
+        (params, self_state)
+    """
+    from train.checkpoint import load_checkpoint as bin_load
+    loaded, _, _, step = bin_load(resume, cfg=cfg, rng=rng, load_opt=False)
+
+    # Copy only the keys cog_train needs (encoder + codebooks + gen_head)
+    wanted = ['encoder', 'hrq', 'sparse', 'lowrank', 'manifold',
+              'binding', 'contrast', 'self', 'gen_head']
+    params = {k: loaded[k] for k in wanted if k in loaded}
+
+    # Self state — not saved in .bin, re-initialise
+    self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
+
+    print(f"[COG] Loaded Stage 2 checkpoint from {resume} (step {step})")
+    print(f"      encoder + {len([k for k in params if k not in ('gen_head',)])} codebooks + "
+          f"{'gen_head' if 'gen_head' in params else 'no'} gen_head")
+    return params, self_state
 
 
 # ─── Init full params ───────────────────────────────────────────────────────
 
-def init_cog_params(cfg, rng, lm_ckpt=None):
+def _load_gen_head_from_lm(lm_ckpt, params):
+    """Load gen_head + w_start from Stage 1 LM .pkl checkpoint."""
+    print(f"[COG] Loading gen_head from Stage 1: {lm_ckpt}")
+    with open(lm_ckpt, 'rb') as f:
+        ckpt = pickle.load(f)
+    params['gen_head'] = jax.tree_util.tree_map(
+        lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
+        ckpt['gen_head'])
+    params['w_start'] = jnp.array(ckpt['w_start'])
+
+
+def init_cog_params(cfg, rng, lm_ckpt=None, resume=None):
     """Initialize all trainable params.
 
-    Passive channel: W_out (trained from scratch).
-    Active channel: gen_head + w_start (loadable from Stage 1 LM checkpoint).
+    Two init modes:
+        1. resume: loads encoder + all codebooks + gen_head from
+           Stage 2 checkpoint. gen_head falls back to lm_ckpt if not in .bin.
+        2. From scratch: random init, gen_head from lm_ckpt if provided.
+
+    Passive channel: W_out (always from scratch).
+    Active channel: gen_head + w_start.
 
     Returns:
         params: Dict of all parameters (including self-lattice).
@@ -52,39 +99,47 @@ def init_cog_params(cfg, rng, lm_ckpt=None):
     keys = jax.random.split(rng, 12)
     d = cfg.d_model
 
-    params = {}
-    # Encoder
-    params['encoder'] = init_encoder_params(
-        keys[0], d, cfg.d_ff, cfg.n_heads, cfg.n_encoder_layers,
-        cfg.vocab_size, cfg.max_seq_len)
+    if resume:
+        params, self_state = load_stage2_params(resume, cfg, rng)
+        # W_out always from scratch
+        params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
 
-    # Codebooks (native lattice format for compatibility with lattice-specific losses)
-    params['hrq'] = init_hrq_params(keys[1], d, cfg.M_top, cfg.M_fine, cfg.n_hrq_layers)
-    params['sparse'] = init_sparse_params(keys[2], d, cfg.M_sparse)
-    params['lowrank'] = init_lowrank_params(keys[3], d, cfg.M_lr, cfg.ranks)
-    params['manifold'] = init_manifold_params(keys[4], d, cfg.M_man, cfg.t_dim)
-    params['binding'] = init_binding_params(keys[5], d, cfg.M_bind, cfg.n_bind_layers, cfg.r_max)
-    params['contrast'] = init_contrast_params(keys[6], d, cfg.M_contrast, cfg.n_contrast_layers)
-
-    # Self lattice params
-    params['self'] = init_self_params(keys[10], d, cfg.n_self_codes)
-    self_state = init_self_state(cfg.n_self_codes, d)
-
-    # Passive channel: transparent consciousness → language projection
-    params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
-
-    # Active channel: fluent language skill
-    if lm_ckpt:
-        print(f"[COG] Loading gen_head from Stage 1: {lm_ckpt}")
-        with open(lm_ckpt, 'rb') as f:
-            ckpt = pickle.load(f)
-        params['gen_head'] = jax.tree_util.tree_map(
-            lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
-            ckpt['gen_head'])
-        params['w_start'] = jnp.array(ckpt['w_start'])
+        if 'gen_head' not in params:
+            if lm_ckpt:
+                _load_gen_head_from_lm(lm_ckpt, params)
+            else:
+                params['gen_head'] = init_gen_head_params(keys[8], d, cfg.vocab_size)
+                params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
+        else:
+            # gen_head loaded from Stage 2 — w_start still needed
+            if lm_ckpt:
+                _load_gen_head_from_lm(lm_ckpt, params)  # overwrite with LM version
+            else:
+                params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
     else:
-        params['gen_head'] = init_gen_head_params(keys[8], d, cfg.vocab_size)
-        params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
+        # ── Mode 2: init from scratch (original behaviour) ──
+        params = {}
+        params['encoder'] = init_encoder_params(
+            keys[0], d, cfg.d_ff, cfg.n_heads, cfg.n_encoder_layers,
+            cfg.vocab_size, cfg.max_seq_len)
+
+        params['hrq'] = init_hrq_params(keys[1], d, cfg.M_top, cfg.M_fine, cfg.n_hrq_layers)
+        params['sparse'] = init_sparse_params(keys[2], d, cfg.M_sparse)
+        params['lowrank'] = init_lowrank_params(keys[3], d, cfg.M_lr, cfg.ranks)
+        params['manifold'] = init_manifold_params(keys[4], d, cfg.M_man, cfg.t_dim)
+        params['binding'] = init_binding_params(keys[5], d, cfg.M_bind, cfg.n_bind_layers, cfg.r_max)
+        params['contrast'] = init_contrast_params(keys[6], d, cfg.M_contrast, cfg.n_contrast_layers)
+
+        params['self'] = init_self_params(keys[10], d, cfg.n_self_codes)
+        self_state = init_self_state(cfg.n_self_codes, d)
+
+        params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
+
+        if lm_ckpt:
+            _load_gen_head_from_lm(lm_ckpt, params)
+        else:
+            params['gen_head'] = init_gen_head_params(keys[8], d, cfg.vocab_size)
+            params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
 
     return params, self_state
 
@@ -205,7 +260,7 @@ def active_loss(logits, targets):
 
 # ─── Training step ──────────────────────────────────────────────────────────
 
-def make_train_step(cfg, optimizer):
+def make_train_step(cfg, optimizer, joint=False):
     """Create jitted training step with dual-channel output + self-lattice.
 
     Every macro step's z_q feeds both channels:
@@ -213,6 +268,11 @@ def make_train_step(cfg, optimizer):
       - Active (expression):      gen_head(z_q) → full-sequence CE
 
     Self-lattice provides internal state machine (mode selection, self output).
+
+    When joint=True, additional Stage 3 losses are computed:
+      - VQ commitment (all codebooks)
+      - Contrastive NCE
+      - Manifold orthogonality
     """
 
     @jax.jit
@@ -291,7 +351,34 @@ def make_train_step(cfg, optimizer):
             loss = p_loss + a_loss + loss_self + jnp.mean(
                 jnp.where(conv, -0.001 * jnp.log(n_steps.astype(jnp.float32) + 1e-8), 0.0))
 
-            aux_out = {'self_state': self_state_out, 'loss_self': loss_self}
+            # ── Stage 3 joint losses (VQ + contrastive + orth) ───────────
+            stage3_extra = {}
+            if joint:
+                rng_fwd, _ = jax.random.split(rng)
+                _, _, logits_fwd, aux_fwd, _ = std_forward(
+                    p, None, inputs, cfg, training=True, rng=rng_fwd,
+                    self_state=self_state_out)
+                logits_fwd = lax.stop_gradient(logits_fwd)
+
+                vq_comps = compute_vq_loss(p, aux_fwd, z, cfg)
+                vq_total = sum(v for v in vq_comps.values())
+                stage3_extra['vq'] = vq_total
+                loss = loss + vq_total
+
+                if 'contrast' in p:
+                    c_loss = cfg.lambda_contrast * contrast_info_nce_loss(
+                        p['contrast'], z, tau=0.5)
+                    stage3_extra['contrast'] = c_loss
+                    loss = loss + c_loss
+
+                if cfg.lambda_orth > 0 and 'manifold' in p:
+                    o_loss = cfg.lambda_orth * jnp.mean(
+                        jnp.sum(p['manifold']['T'] ** 2, axis=(-2, -1)))
+                    stage3_extra['orth'] = o_loss
+                    loss = loss + o_loss
+
+            aux_out = {'self_state': self_state_out, 'loss_self': loss_self,
+                       'stage3': stage3_extra}
             return loss, aux_out
 
         (loss, aux_out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -308,8 +395,18 @@ def make_train_step(cfg, optimizer):
 
 def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               seq_len=256, log_every=100, save_every=1000,
-              data_path=None, shape_path=None, lm_ckpt=None):
-    """Run dual-channel cognitive training."""
+              data_path=None, shape_path=None, lm_ckpt=None,
+              resume=None, joint=False, auto_mode=False):
+    """Run dual-channel cognitive training.
+
+    Args:
+        resume: Optional Stage 2 checkpoint dir. Loads encoder + codebooks
+                + gen_head for joint fine-tuning under cognitive loop.
+        joint: When True, adds Stage 3 losses (VQ commitment + contrastive
+               NCE + manifold orth) on top of the dual-channel losses.
+        auto_mode: When True, enables Supervisor for NaN detection,
+                   auto-rollback, crash recovery, and best checkpoint saving.
+    """
     from train.data import WikiDataIter
     from tqdm import tqdm
 
@@ -317,7 +414,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     rng = jax.random.PRNGKey(42)
 
     rng, init_rng = jax.random.split(rng)
-    params, self_state = init_cog_params(cfg, init_rng, lm_ckpt=lm_ckpt)
+    params, self_state = init_cog_params(cfg, init_rng, lm_ckpt=lm_ckpt,
+                                          resume=resume)
 
     schedule = optax.cosine_decay_schedule(
         init_value=lr, decay_steps=steps, alpha=0.1)
@@ -330,7 +428,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     opt_state = optimizer.init(params)
 
     data_iter = WikiDataIter(data_path, shape_path, B=batch_size, N=seq_len)
-    train_step = make_train_step(cfg, optimizer)
+    train_step = make_train_step(cfg, optimizer, joint=joint)
 
     codebooks_flat = pack_codebooks_for_c(params)
     avg_dists = avg_codebook_distances(codebooks_flat)
@@ -340,11 +438,19 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     d = cfg.d_model
     total_params = sum(p.size for p in jax.tree_util.tree_leaves(params)
                        if hasattr(p, 'size'))
-    has_lm = 'gen_head' in params
-    print(f"[COG] Dual-channel: passive (z_q @ W_out) + active (gen_head{' from LM' if lm_ckpt else ' init'})")
+    has_gh = 'gen_head' in params
+    if resume:
+        gh_src = f"Stage 2{' + LM' if lm_ckpt else ''}"
+    elif lm_ckpt:
+        gh_src = 'LM'
+    else:
+        gh_src = 'random'
+    print(f"[COG] Dual-channel: passive (z_q @ W_out) + active (gen_head{' from ' + gh_src if has_gh else ' init'})")
     print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
     print(f"[COG] Total params: {total_params:,}")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
+    if joint:
+        print(f"[COG] Joint mode: + Stage 3 losses (VQ + contrastive + orth)")
     print()
 
     import numpy as _np_np
@@ -373,19 +479,35 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     _signal.signal(_signal.SIGINT, _handler)
 
+    # ── Auto supervisor ──
+    sup = None
+    if auto_mode:
+        from train.train_supervisor import Supervisor
+        sup = Supervisor(output_dir, cfg, enable_auto=True,
+                         val_data_path=data_path, val_shape_path=shape_path)
+
     for step in range(steps):
         batch = next(data_iter)
         current_lr = schedule(step)
         rng, step_rng = jax.random.split(rng)
 
-        params, opt_state, loss_val, aux_out = train_step(
-            params, opt_state, batch, current_lr, step_rng, self_state=self_state)
+        if sup:
+            params, opt_state, loss_val, aux_out = sup.step(
+                train_step, params, opt_state, batch, step_rng,
+                step=step, self_state=self_state, lr=current_lr)
+        else:
+            params, opt_state, loss_val, aux_out = train_step(
+                params, opt_state, batch, current_lr, step_rng, self_state=self_state)
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
             self_state = aux_out['self_state']
 
-        running_loss += float(loss_val)
+        loss_f = float(loss_val)
+        if np.isnan(loss_f) or np.isinf(loss_f):
+            continue
+
+        running_loss += loss_f
 
         if step % log_every == 0 and step > 0:
             avg_loss = running_loss / log_every
@@ -398,6 +520,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                 parts.append(f"self={loss_self:.6f}")
             parts.append(f"lr={current_lr:.2e} | {tok_s:.0f} tok/s")
             tqdm.write(" | ".join(parts))
+            if sup:
+                sup.report(step)
             running_loss = 0.0
             start_time = time.time()
 
@@ -409,6 +533,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     pbar.close()
     save_cog_checkpoint(params, output_dir, steps, self_state=self_state)
+    if sup and sup.best_params is not None:
+        sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step)
     print(f"[COG] Training complete → {output_dir}/")
 
 

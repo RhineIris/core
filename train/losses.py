@@ -33,6 +33,9 @@ def compute_lm_loss(logits, targets, vocab_size):
 
 def compute_vq_loss(params, aux, z, cfg: LCMConfig):
     """Compute all VQ commitment losses."""
+    # Normalize z to unit sphere so commitment is about direction, not magnitude.
+    # Without this, encoder output can grow unboundedly and commitment loss explodes.
+    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
     losses = {}
 
     # Routing gate
@@ -80,10 +83,12 @@ def compute_vq_loss(params, aux, z, cfg: LCMConfig):
 
 
 def _commit_loss(z, C, beta=0.25):
-    """VQ commitment loss: β·||sg[z] - C[idx]||²."""
-    dist = jnp.linalg.norm(z[:, None, :] - C[None, :, :], axis=-1)
+    """VQ commitment loss: β·||sg[z_norm] - C_norm[idx]||² (unit-sphere)."""
+    z_n = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
+    C_n = C / (jnp.linalg.norm(C, axis=-1, keepdims=True) + 1e-8)
+    dist = jnp.linalg.norm(z_n[:, None, :] - C_n[None, :, :], axis=-1)
     idx = dist.argmin(axis=-1)
-    return beta * jnp.mean((lax.stop_gradient(z) - C[idx]) ** 2)
+    return beta * jnp.mean((lax.stop_gradient(z_n) - C_n[idx]) ** 2)
 
 
 def compute_contrast_loss(params, z, cfg: LCMConfig, gvalue=None):

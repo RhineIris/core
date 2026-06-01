@@ -142,9 +142,137 @@ def _load_cfg(cfg):
     )
 
 
+def _cmd_ckpt_list(base_dir, long_mode=False):
+    """List all checkpoints in a directory."""
+    import glob
+    if not os.path.isdir(base_dir):
+        print(f"Not found: {base_dir}")
+        return
+    dirs = sorted(glob.glob(os.path.join(base_dir, "step_*")))
+    if not dirs:
+        print(f"No checkpoints in {base_dir}/")
+        return
+    total = 0
+    print(f"Checkpoints in {base_dir}/:")
+    for d in dirs:
+        name = os.path.basename(d)
+        size = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
+                   if os.path.isfile(os.path.join(d, f)))
+        total += size
+        if long_mode:
+            cfg = os.path.join(d, "config.json")
+            step = name.replace("step_", "")
+            step_info = f"  step={step}"
+            if os.path.isfile(cfg):
+                import json
+                with open(cfg) as f:
+                    c = json.load(f)
+                step_info += f"  d_model={c.get('d_model','?')}"
+            print(f"  {name}  {size/1e6:.0f} MB{step_info}")
+        else:
+            print(f"  {name}  ({size/1e6:.0f} MB)")
+    print(f"  Total: {len(dirs)} checkpoints, {total/1e6:.0f} MB")
+
+
+def _cmd_data_stats(data_path, shape_path=None, num_samples=5, tokenizer_path="data/tokenizer.json"):
+    """Show token data statistics and sample decoded text."""
+    import json
+    import numpy as np
+
+    shape_path = shape_path or data_path.replace(".dat", "_shape.json")
+    if not os.path.isfile(shape_path):
+        print(f"Shape file not found: {shape_path}")
+        return
+    with open(shape_path) as f:
+        meta = json.load(f)
+    n_tokens = meta.get("n_tokens", "?")
+    print(f"Data file: {data_path}")
+    print(f"Shape:     {n_tokens:,} tokens" if isinstance(n_tokens, int) else f"Shape:  {n_tokens}")
+    file_size = os.path.getsize(data_path)
+    print(f"Size:      {file_size / 1e6:.0f} MB ({file_size:,} bytes)")
+    print(f"Dtype:     uint16 ({file_size // 2:,} tokens)")
+
+    # Try to load tokenizer and decode samples
+    if os.path.isfile(tokenizer_path):
+        try:
+            from tokenizers import Tokenizer
+            tok = Tokenizer.from_file(tokenizer_path)
+            data = np.memmap(data_path, dtype=np.uint16, mode="r")
+            print(f"\nSamples (first {num_samples}):")
+            for i in range(min(num_samples, 5)):
+                start = i * 512
+                end = start + min(100, len(data) - start)
+                ids = data[start:end].tolist()
+                txt = tok.decode(ids)
+                print(f"  [{i}] {txt[:120]}...")
+        except Exception as e:
+            print(f"  (tokenizer decode skipped: {e})")
+    print()
+
+
+def _cmd_ckpt_prune(base_dir, keep=5):
+    """Prune old checkpoints, keep N latest."""
+    import glob
+    dirs = sorted(glob.glob(os.path.join(base_dir, "step_*")),
+                  key=lambda d: os.path.getmtime(d))
+    if len(dirs) <= keep:
+        print(f"Only {len(dirs)} checkpoints, nothing to prune (keep={keep})")
+        return
+    remove = dirs[:-keep]
+    for d in remove:
+        import shutil
+        shutil.rmtree(d)
+        print(f"  Removed: {d}")
+    print(f"Pruned {len(remove)}, kept {keep}")
+
+
 def _fmt_step(step):
     """Zero-padded step string, e.g. 1234 → '01234'."""
     return f"{step:05d}"
+
+
+def _find_latest_checkpoint(base_dir):
+    """Find the most recent checkpoint directory under base_dir/.
+
+    Looks for step_XXXXX/ dirs and returns the path + step number.
+    Returns (None, 0) if nothing found.
+    """
+    import glob
+    if not os.path.isdir(base_dir):
+        return None, 0
+    dirs = glob.glob(os.path.join(base_dir, "step_*"))
+    if not dirs:
+        # Maybe it's already a checkpoint dir (has config.json)
+        if os.path.isfile(os.path.join(base_dir, "config.json")):
+            return base_dir, 0
+        return None, 0
+    latest = max(dirs, key=lambda d: os.path.getmtime(d))
+    try:
+        step = int(os.path.basename(latest).replace("step_", ""))
+    except ValueError:
+        step = 0
+    return latest, step
+
+
+def _prompt_resume(default_dir, stage_name, yes_mode=False):
+    """Check if a checkpoint exists and prompt to resume.
+
+    Returns:
+        resume_path or None
+    """
+    path, step = _find_latest_checkpoint(default_dir)
+    if path is None:
+        return None
+    if yes_mode:
+        print(f"  -> 使用最近检查点: {path} (step {step})")
+        return path
+    try:
+        ans = input(f"  [{stage_name}] 检测到检查点 {path} (step {step}), 从中恢复? [Y/n] ").strip().lower()
+        if ans in ("", "y", "yes"):
+            return path
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return None
 
 
 # ── mode 1: training ─────────────────────────────────────────────────────────
@@ -165,11 +293,7 @@ def train(args):
 
     # ── Stage 1: train model (decoder LM) ────────────────────────────────
     if args.stage == 1:
-        print("=" * 60)
-        print("  Stage 1: Decoder-only LM Pretraining")
-        print("  Trains gen_head as a standalone autoregressive LM.")
-        print("  No encoder, no codebooks. Pure language model.")
-        print("=" * 60)
+        print("\nStage 1: decoder-only LM pretraining (gen_head)")
         from train.train_lm import train_lm
         train_lm(
             cfg=LCMConfig(),
@@ -188,12 +312,12 @@ def train(args):
 
     # ── Stage 2: train memory (encoder + codebooks) ──────────────────────
     if args.stage == 2:
-        print("=" * 60)
-        print("  Stage 2: Encoder + Codebook Training")
-        print("  Loads trained gen_head (frozen), trains encoder and all")
-        print("  6 codebook lattices with VQ + contrastive losses.")
-        print("=" * 60)
+        print("\nStage 2: encoder + codebook training")
         from train.train_memory import train_memory
+        resume = args.resume
+        if not resume:
+            out_dir = args.save_dir or "checkpoints"
+            resume = _prompt_resume(out_dir, "Stage 2", args.yes)
         train_memory(
             cfg=LCMConfig(),
             data_path=args.data,
@@ -206,18 +330,16 @@ def train(args):
             seq_len=args.seq_len,
             log_every=100,
             save_every=args.save,
-            resume_from=args.resume,
+            resume_from=resume,
         )
         return
 
-    # ── Stage 3: joint fine-tuning (existing full training) ──────────────
-    print("=" * 60)
-    print("  Stage 3: Joint Fine-tuning")
-    print("  All params unfrozen, lower learning rate.")
-    print("=" * 60)
+    # ── Stage 3: joint fine-tuning ──
+    print("\nStage 3: joint fine-tuning (all params unfrozen)")
     from train.train import create_train_state, train_step, compute_codebook_utilization
     from train.data import WikiDataIter
 
+    resume = args.resume
     cfg = _load_cfg(args)
     d = cfg.d_model
     shape_path = args.shape or _make_shape_path(args.data)
@@ -233,12 +355,14 @@ def train(args):
 
     # Init / resume
     rng = jax.random.PRNGKey(42)
-    if args.resume:
+    if not resume:
+        resume = _prompt_resume(save_dir, "Stage 3", args.yes)
+    if resume:
         from train.checkpoint import load_checkpoint as bin_load
         params, gvalue, opt_state, ckpt_step = bin_load(
-            args.resume, cfg=None, rng=rng, load_opt=True)
+            resume, cfg=None, rng=rng, load_opt=True)
         import json
-        ckpt_cfg_path = os.path.join(args.resume, "config.json")
+        ckpt_cfg_path = os.path.join(resume, "config.json")
         if os.path.exists(ckpt_cfg_path):
             with open(ckpt_cfg_path) as f:
                 for k, v in json.load(f).items():
@@ -266,10 +390,7 @@ def train(args):
 
     signal.signal(signal.SIGINT, _handler)
 
-    print(f"\n{'─' * 60}")
-    print(f"Step {start_step} → {args.steps}")
-    print(f"Checkpoints → {save_dir}/step_XXXXX/")
-    print(f"{'─' * 60}")
+    print(f"\nStep {start_step} → {args.steps} | checkpoints → {save_dir}/")
 
     from tqdm import tqdm
     pbar = tqdm(total=args.steps - start_step, desc="   training", unit="step",
@@ -1875,6 +1996,10 @@ def main():
                    help="Checkpoint save directory (default: ./checkpoints)")
     p.add_argument("-r", "--resume", default=None,
                    help="Resume from checkpoint directory, e.g. checkpoints/step_01000")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="Auto-confirm prompts (use latest checkpoint)")
+    p.add_argument("--auto", action="store_true",
+                   help="Auto mode: monitor loss, auto-recover NaN/crashes, save best checkpoint")
     p.add_argument("-p", "--shape", default=None,
                    help="Path to shape JSON (auto-derived from -d if omitted)")
 
@@ -1883,12 +2008,12 @@ def main():
                    help="Training stage. 1=train_model (decoder LM via train_lm.py), 2=train_memory (encoder+codebooks via train_memory.py), 3=joint finetune")
     p.add_argument("-L", "--load-lm", default=None,
                    help="Load trained gen_head from LM checkpoint (.pkl), used by --stage 2")
-    p.add_argument("--lr-stage2", type=float, default=1e-4,
-                   help="Stage 2 learning rate (default 1e-4)")
-    p.add_argument("--lr-stage3", type=float, default=1e-4,
-                   help="Stage 3 learning rate (default 1e-4)")
+    p.add_argument("-2", "--lr-stage2", type=float, default=1e-4,
+                   help="Stage 2 lr (default 1e-4)")
+    p.add_argument("-3", "--lr-stage3", type=float, default=1e-4,
+                   help="Stage 3 lr (default 1e-4)")
     p.add_argument("-m", "--memory-steps", type=int, default=20000,
-                   help="Stage 2 memory training steps (default 20000)")
+                   help="Stage 2 steps (default 20000)")
 
     # ── interactive options (C inference engine) ───────────────────────────
     p.add_argument("-N", "--max-new", type=int, default=128,
@@ -1948,22 +2073,14 @@ def main():
     p.add_argument("--active-max-burst", type=int, default=32,
                    help="Max tokens per active output burst (default 32)")
 
-    # ── cognitive training (end-to-end) ──
-    p.add_argument("--cog-train", action="store_true",
-                   help="Dual-channel cognitive training: passive (W_out) + active (gen_head)")
-    p.add_argument("--cog-steps", type=int, default=50000,
-                   help="Cognitive training steps (default 50000)")
-    p.add_argument("--cog-lr", type=float, default=3e-4,
-                   help="Cognitive training learning rate (default 3e-4)")
-    p.add_argument("--cog-batch", type=int, default=4,
-                   help="Cognitive training batch size (default 4)")
-    p.add_argument("--cog-seq", type=int, default=256,
-                   help="Cognitive training sequence length (default 256)")
-    p.add_argument("--cog-save", type=int, default=1000,
-                   help="Cognitive training save interval (default 1000)")
-    p.add_argument("--from-lm-ckpt", default=None,
-                   help="Load Stage 1 gen_head + w_start from this LM checkpoint")
-
+    # ── cognitive training ──
+    p.add_argument("-C", "--cog-train", action="store_true", help="Cognitive training")
+    p.add_argument("-G", "--cog-steps", type=int, default=50000, help="Cog steps (default 50000)")
+    p.add_argument("-R", "--cog-lr", type=float, default=3e-4, help="Cog lr (default 3e-4)")
+    p.add_argument("-J", "--cog-batch", type=int, default=4, help="Cog batch (default 4)")
+    p.add_argument("-Q", "--cog-seq", type=int, default=256, help="Cog seq len (default 256)")
+    p.add_argument("-V", "--cog-save", type=int, default=1000, help="Cog save interval (default 1000)")
+    p.add_argument("-F", "--from-lm-ckpt", default=None, help="Load Stage 1 gen_head")
     # ── subcommands ─────────────────────────────────────────────────────
     sub = p.add_subparsers(dest="mode")
 
@@ -1998,20 +2115,115 @@ def main():
     pc.add_argument("--fuzzy-threshold", type=float, default=0.7,
                     help="Jaccard similarity threshold for fuzzy dedup (default 0.7)")
 
-    # ── chart subcommand ────────────────────────────────────────────────
+    # ── unified training subcommand ──
+    ptr = sub.add_parser("train", help="Unified training entry")
+    ptr.add_argument("--stage", required=True, choices=["1","2","3","cog"], help="Training stage")
+    ptr.add_argument("-d", "--data", help="Path to tokenized .dat file")
+    ptr.add_argument("-b", "--batch-size", type=int, default=16)
+    ptr.add_argument("-s", "--seq-len", type=int, default=512)
+    ptr.add_argument("-S", "--steps", type=int, default=100000)
+    ptr.add_argument("-l", "--lr", type=float, default=None)
+    ptr.add_argument("-o", "--save-dir", default=None)
+    ptr.add_argument("-c", "--save", type=int, default=1000)
+    ptr.add_argument("-r", "--resume", default=None)
+    ptr.add_argument("-L", "--load-lm", default=None)
+    ptr.add_argument("-2", "--lr-stage2", type=float, default=1e-4)
+    ptr.add_argument("-3", "--lr-stage3", type=float, default=1e-4)
+    ptr.add_argument("-m", "--memory-steps", type=int, default=20000)
+    ptr.add_argument("-y", "--yes", action="store_true")
+    ptr.add_argument("--auto", action="store_true", help="Auto mode: monitor + auto-recover")
+    ptr.add_argument("-F", "--from-lm-ckpt", default=None)
+    ptr.add_argument("-C", "--cog-steps", type=int, default=50000)
+    ptr.add_argument("-R", "--cog-lr", type=float, default=3e-4)
+    ptr.add_argument("-J", "--cog-batch", type=int, default=4)
+    ptr.add_argument("-Q", "--cog-seq", type=int, default=256)
+    ptr.add_argument("-V", "--cog-save", type=int, default=1000)
+    ptr.add_argument("--d-model", type=int, default=256)
+    ptr.add_argument("-f", "--d-ff", type=int, default=None)
+    ptr.add_argument("-n", "--n-heads", type=int, default=4)
+
+    # ── checkpoint subcommands ──
+    pck = sub.add_parser("ckpt", help="Manage checkpoints")
+    pck_sub = pck.add_subparsers(dest="ckpt_action")
+    pck_ls = pck_sub.add_parser("list", help="List checkpoints")
+    pck_ls.add_argument("dir", nargs="?", default="checkpoints",
+                        help="Checkpoint directory (default: checkpoints/)")
+    pck_ls.add_argument("-l", dest="long", action="store_true",
+                        help="Detailed listing (config, sizes)")
+    pck_pr = pck_sub.add_parser("prune", help="Prune old checkpoints, keep N latest")
+    pck_pr.add_argument("dir", nargs="?", default="checkpoints",
+                        help="Checkpoint directory (default: checkpoints/)")
+    pck_pr.add_argument("-k", type=int, default=5,
+                        help="Keep latest N checkpoints (default 5)")
+    pck_df = pck_sub.add_parser("diff", help="Compare two checkpoints")
+    pck_df.add_argument("dir1", help="First checkpoint directory")
+    pck_df.add_argument("dir2", help="Second checkpoint directory")
+
+    # ── eval subcommands ──
+    pev = sub.add_parser("eval", help="Evaluate model")
+    pev_sub = pev.add_subparsers(dest="eval_action")
+    pev_ppl = pev_sub.add_parser("ppl", help="Compute perplexity on data")
+    pev_ppl.add_argument("checkpoint", help="Checkpoint directory")
+    pev_ppl.add_argument("data", help="Path to .dat file")
+    pev_ppl.add_argument("--batches", type=int, default=10, help="Number of batches (default 10)")
+    pev_ppl.add_argument("--shape", default=None, help="Path to shape JSON")
+    pev_tr = pev_sub.add_parser("trace", help="Run cognitive loop trace")
+    pev_tr.add_argument("checkpoint", help="Checkpoint directory")
+    pev_tr.add_argument("--prompt", default="Hello", help="Prompt text (default: Hello)")
+    pev_tr.add_argument("--tokens", type=int, default=5, help="Tokens to trace (default 5)")
+
+    # ── report subcommand ──
+    prp = sub.add_parser("report", help="Model architecture report")
+    prp.add_argument("checkpoint", help="Checkpoint directory")
+
+    # ── serve subcommand ──
+    ps = sub.add_parser("serve", help="Start HTTP inference server (OpenAI-compatible)")
+    ps.add_argument("checkpoint", help="Checkpoint directory")
+    ps.add_argument("--port", type=int, default=8080, help="Port (default 8080)")
+    ps.add_argument("--host", default="0.0.0.0", help="Host (default 0.0.0.0)")
+
+    # ── batch subcommand ──
+    pb = sub.add_parser("batch", help="Batch generate from JSONL")
+    pb.add_argument("checkpoint", help="Checkpoint directory")
+    pb.add_argument("-i", "--input", required=True, help="Input JSONL file")
+    pb.add_argument("-o", "--output", required=True, help="Output JSONL file")
+
+    # ── chat subcommand ──
+    pch = sub.add_parser("chat", help="Interactive chat REPL")
+    pch.add_argument("checkpoint", help="Checkpoint directory")
+    pch.add_argument("--max-new", type=int, default=128)
+    pch.add_argument("--temp", type=float, default=0.7)
+
+    # ── data subcommands ──
+    pds = sub.add_parser("data", help="Data inspection tools")
+    pds_sub = pds.add_subparsers(dest="data_action")
+    pds_st = pds_sub.add_parser("stats", help="Token data statistics")
+    pds_st.add_argument("data", help="Path to .dat file")
+    pds_st.add_argument("--shape", default=None, help="Path to shape JSON")
+    pds_st.add_argument("--top-k", type=int, default=20, help="Top-K tokens (default 20)")
+    pds_st.add_argument("-t", "--tokenizer", default="data/tokenizer.json")
+    pds_sm = pds_sub.add_parser("sample", help="Sample decoded text from data")
+    pds_sm.add_argument("data", help="Path to .dat file")
+    pds_sm.add_argument("--shape", default=None, help="Path to shape JSON")
+    pds_sm.add_argument("-t", "--tokenizer", default="data/tokenizer.json")
+    pds_sm.add_argument("-n", "--count", type=int, default=5, help="Number of samples (default 5)")
+    pds_sm.add_argument("-l", "--length", type=int, default=100, help="Tokens per sample (default 100)")
+    pds_sm.add_argument("--seed", type=int, default=42, help="Random seed (default 42)")
+
+    # ── chart subcommand ──
     pch = sub.add_parser("chart", help="Generate training metrics HTML chart from saved JSON")
     pch.add_argument("-i", "--input", default="checkpoints/metrics.json",
                      help="Path to metrics.json (default: checkpoints/metrics.json)")
     pch.add_argument("-o", "--output", default="metrics.html",
                      help="Output HTML path (default: metrics.html)")
 
-    # ── export subcommand ──────────────────────────────────────────────
+    # ── export subcommand ──
     pe = sub.add_parser("export", help="Export cog_train checkpoint → C inference engine format")
     pe.add_argument("ckpt_dir", help="Path to cog_train checkpoint directory (e.g. checkpoints/cog/step_010000)")
     pe.add_argument("-o", "--out", default=None, help="Output directory (default: ckpt_dir + _infer)")
     pe.add_argument("--data-dir", default="data", help="Data directory (for tokenizer.json)")
 
-    # ── build subcommand ───────────────────────────────────────────────
+    # ── build subcommand ──
     pb = sub.add_parser("build", help="Compile Cython acceleration extensions (.pyx → .so)")
     pb.add_argument("--inplace", action="store_true", default=True,
                     help="Build in-place (default: true)")
@@ -2023,6 +2235,53 @@ def main():
         preprocess(args)
     elif args.mode == "clean":
         clean(args)
+    elif args.mode == "train":
+        _cmd_train(args)
+        return
+    elif args.mode == "ckpt":
+        if args.ckpt_action == "list":
+            _cmd_ckpt_list(args.dir, args.long)
+        elif args.ckpt_action == "prune":
+            _cmd_ckpt_prune(args.dir, args.k)
+        elif args.ckpt_action == "diff":
+            from train.cli_extras import cmd_ckpt_diff
+            cmd_ckpt_diff(args)
+        return
+    elif args.mode == "eval":
+        if args.eval_action == "ppl":
+            from train.cli_extras import cmd_eval_ppl
+            cmd_eval_ppl(args)
+        elif args.eval_action == "trace":
+            from train.cli_extras import cmd_eval_trace
+            cmd_eval_trace(args)
+        return
+    elif args.mode == "report":
+        from train.cli_extras import cmd_report
+        cmd_report(args)
+        return
+    elif args.mode == "serve":
+        from train.cli_extras import cmd_serve
+        cmd_serve(args)
+        return
+    elif args.mode == "batch":
+        from train.cli_extras import cmd_batch
+        cmd_batch(args)
+        return
+    elif args.mode == "chat":
+        from train.cli_extras import cmd_chat
+        cmd_chat(args)
+        return
+    elif args.mode == "data":
+        from train.cli_extras import cmd_data_stats as cd_stats
+        from train.cli_extras import cmd_data_sample
+        if args.data_action == "stats":
+            cd_stats(args)
+        elif args.data_action == "sample":
+            cmd_data_sample(args)
+        return
+    elif args.mode == "stats":
+        _cmd_data_stats(args.data, args.shape, args.num_samples, args.tokenizer)
+        return
     elif args.mode == "chart":
         from train.monitor import make_chart_html
         make_chart_html(args.input, args.output)
@@ -2044,9 +2303,13 @@ def main():
         from train.cog_train import train_cog
         cfg = LCMConfig()
         shape = args.shape or (args.data.replace(".dat", "_shape.json") if args.data else None)
+        out_dir = args.save_dir or "checkpoints/cog"
+        resume = args.resume
+        if not resume:
+            resume = _prompt_resume(out_dir, "CogTrain", args.yes)
         train_cog(
             cfg=cfg,
-            output_dir=args.save_dir or "checkpoints/cog",
+            output_dir=out_dir,
             steps=args.cog_steps,
             lr=args.cog_lr,
             batch_size=args.cog_batch,
@@ -2056,6 +2319,9 @@ def main():
             data_path=args.data,
             shape_path=shape,
             lm_ckpt=args.from_lm_ckpt,
+            resume=resume,
+            joint=(args.stage == 3),
+            auto_mode=args.auto,
         )
     elif args.data:
         train(args)
@@ -2064,6 +2330,29 @@ def main():
     else:
         p.print_help()
         sys.exit(1)
+
+
+def _cmd_train(subargs):
+    """Dispatch for 'python lcm.py train --stage X'."""
+    _require_jax()
+    stage = subargs.stage
+    if stage == "cog":
+        from train.config import LCMConfig
+        from train.cog_train import train_cog
+        cfg = LCMConfig()
+        shape = subargs.shape or (subargs.data.replace(".dat", "_shape.json") if subargs.data else None)
+        out_dir = subargs.save_dir or "checkpoints/cog"
+        resume = subargs.resume
+        if not resume:
+            resume = _prompt_resume(out_dir, "CogTrain", subargs.yes)
+        train_cog(cfg=cfg, output_dir=out_dir, steps=subargs.cog_steps,
+                  lr=subargs.cog_lr, batch_size=subargs.cog_batch, seq_len=subargs.cog_seq,
+                  log_every=100, save_every=subargs.cog_save, data_path=subargs.data,
+                  shape_path=shape, lm_ckpt=subargs.from_lm_ckpt, resume=resume,
+                  joint=False, auto_mode=subargs.auto)
+    else:
+        subargs.stage = int(stage)
+        train(subargs)
 
 
 if __name__ == "__main__":

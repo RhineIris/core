@@ -112,6 +112,10 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
 
     # Encoder
     z = encoder_forward(params['encoder'], x, cfg.n_heads)  # (B, d)
+    # Normalize to unit sphere so encoder magnitude doesn't explode through
+    # lattice forwards and commitment losses. Without this, N=512 with random
+    # init can produce z-norms that overflow downstream softmax/log ops.
+    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
 
     # Routing gate with optional bias injection
     route_params = params['route']

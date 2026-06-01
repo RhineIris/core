@@ -88,8 +88,10 @@ def _sample_gumbel(rng, shape):
 
 
 def route_commit_loss(z, z_route, beta=0.25):
-    """VQ commitment loss for routing gate."""
-    return beta * jnp.mean((lax.stop_gradient(z) - z_route) ** 2)
+    """VQ commitment loss for routing gate (unit-sphere normalized)."""
+    z_n = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
+    zr_n = z_route / (jnp.linalg.norm(z_route, axis=-1, keepdims=True) + 1e-8)
+    return beta * jnp.mean((lax.stop_gradient(z_n) - zr_n) ** 2)
 
 
 # ── 4.1 Hierarchical Lattice (Λ_hrq) ────────────────────────────────────────
@@ -493,18 +495,14 @@ def contrast_info_nce_loss(params, z, tau=0.5):
         d_b_pos = jnp.take_along_axis(d_b, idx_b[:, None], axis=-1).squeeze(-1)
 
         # InfoNCE: a vs b negatives, b vs a negatives
-        loss_a = -jnp.log(
-            jnp.exp(-d_a_pos / tau) /
-            (jnp.exp(-d_a_pos / tau) +
-             jnp.sum(jnp.exp(-d_b / tau), axis=-1) -
-             jnp.exp(-d_b_pos / tau))
-        )
-        loss_b = -jnp.log(
-            jnp.exp(-d_b_pos / tau) /
-            (jnp.exp(-d_b_pos / tau) +
-             jnp.sum(jnp.exp(-d_a / tau), axis=-1) -
-             jnp.exp(-d_a_pos / tau))
-        )
+        # Safe logsumexp formulation: log(exp(x)/sum(exp)) = x - logsumexp(all)
+        def _ce_safe(pos, all_vals):
+            s = jax.nn.logsumexp(-all_vals / tau, axis=-1)
+            x = -pos / tau
+            return -jnp.mean(x - s)
+
+        loss_a = _ce_safe(d_a_pos, d_b)
+        loss_b = _ce_safe(d_b_pos, d_a)
         loss = loss + jnp.mean(loss_a) + jnp.mean(loss_b)
 
     return loss

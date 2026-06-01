@@ -20,6 +20,7 @@ import json
 import os
 import pickle
 import signal
+import sys
 import time
 from functools import partial
 
@@ -281,11 +282,9 @@ def train_memory(cfg, data_path, shape_path, output_dir,
     signal.signal(signal.SIGINT, _handler)
 
     # ── Training loop ─────────────────────────────────────────────────
-    print(f"\n{'─' * 60}")
-    print(f"Memory training: {steps} steps, lr={lr}, B={batch_size}, N={seq_len}")
-    print(f"gen_head frozen: YES | Losses: VQ + contrast + orth (NO LM)")
-    print(f"Checkpoints → {output_dir}/step_XXXXX/ (every {save_every})")
-    print(f"{'─' * 60}")
+    print(f"\nStage 2: {steps} steps, lr={lr}, B={batch_size}, N={seq_len}")
+    print(f"  gen_head frozen | losses: VQ + contrast + orth")
+    print(f"  checkpoints → {output_dir}/ (every {save_every})")
 
     from tqdm import tqdm
     from train.monitor import MetricsRecorder
