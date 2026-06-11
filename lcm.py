@@ -2081,6 +2081,18 @@ def main():
     p.add_argument("-Q", "--cog-seq", type=int, default=256, help="Cog seq len (default 256)")
     p.add_argument("-V", "--cog-save", type=int, default=1000, help="Cog save interval (default 1000)")
     p.add_argument("-F", "--from-lm-ckpt", default=None, help="Load Stage 1 gen_head")
+
+    # ── language LCM training ──
+    p.add_argument("--lang-train", action="store_true", help="Language LCM training (Stage 1)")
+    p.add_argument("--lang-infer", default=None, metavar="CKPT",
+                   help="Language LCM inference checkpoint path")
+    p.add_argument("--lang-steps", type=int, default=100000, help="Lang LCM steps (default 100000)")
+    p.add_argument("--lang-lr", type=float, default=3e-4, help="Lang LCM lr (default 3e-4)")
+    p.add_argument("--lang-batch", type=int, default=16, help="Lang LCM batch (default 16)")
+    p.add_argument("--lang-seq", type=int, default=512, help="Lang LCM seq len (default 512)")
+    p.add_argument("--lang-save", type=int, default=10000, help="Lang LCM save interval (default 10000)")
+    p.add_argument("--from-lang-ckpt", default=None, help="Load Stage 1 Language LCM for cog training")
+    p.add_argument("--prompt", default=None, help="Prompt text for --lang-infer")
     # ── subcommands ─────────────────────────────────────────────────────
     sub = p.add_subparsers(dest="mode")
 
@@ -2318,11 +2330,48 @@ def main():
             save_every=args.cog_save,
             data_path=args.data,
             shape_path=shape,
-            lm_ckpt=args.from_lm_ckpt,
+            lang_ckpt=args.from_lang_ckpt or args.from_lm_ckpt,
             resume=resume,
             joint=(args.stage == 3),
             auto_mode=args.auto,
         )
+    elif args.lang_train:
+        _require_jax()
+        from train.config import LCMConfig
+        from train.train_lang_lcm import train_lang_lcm
+        cfg = LCMConfig()
+        shape = args.shape or (args.data.replace(".dat", "_shape.json") if args.data else None)
+        out_dir = args.save_dir or "checkpoints/lang_lm"
+        train_lang_lcm(
+            cfg=cfg,
+            output_dir=out_dir,
+            steps=args.lang_steps,
+            lr=args.lang_lr,
+            batch_size=args.lang_batch,
+            seq_len=args.lang_seq,
+            log_every=100,
+            save_every=args.lang_save,
+            from_ckpt=args.resume,
+            data_path=args.data,
+            shape_path=shape,
+        )
+    elif args.lang_infer:
+        _require_jax()
+        from train.config import LCMConfig
+        from train.lang_lcm import init_lang_lcm_params, lang_lcm_generate
+        from train.train_lang_lcm import load_checkpoint
+        cfg = LCMConfig()
+        params, _ = load_checkpoint(args.lang_infer)
+        tokenizer = _load_tokenizer()
+        prompt_text = args.prompt or "今天天气"
+        prompt_ids = tokenizer.encode(prompt_text).ids
+        rng = jax.random.PRNGKey(42)
+        tokens = lang_lcm_generate(
+            params, prompt_ids, max_len=args.max_new or 128,
+            bos_id=1, eos_id=2, rng=rng, cfg=cfg)
+        output = tokenizer.decode(tokens)
+        print(f"\n[LANG] Prompt: {prompt_text}")
+        print(f"[LANG] Output: {output}")
     elif args.data:
         train(args)
     elif args.interact:

@@ -1,6 +1,6 @@
 # Lattice Cognitive Model (LCM) Technical Specification and Implementation Guide v3.0
 
-> **Version Notes**: This technical document provides a comprehensive mathematical refinement of the core modules of the "Lattice Cognitive Model (LCM)" project book, covering complete engineering implementation details from discrete memory lattices, generation head, to training losses. v3.0 completely rewrites the codebook update mechanism (hybrid EMA/gradient management), the binding lattice unbinding method (conjugate multiplication), routing gating (Gumbel-Softmax), contrast lattice collapse prevention (feature bank), low-rank lattice parameterization (pure gradient), and linear attention normalization, abolishes the FSP module, and separates the inference process into an independent zero-parameter inference engine (see c.md), streamlining the original inference decoder into a lightweight generation head.
+> **Version Notes**: This technical document provides a comprehensive mathematical refinement of the core modules of the "Lattice Cognitive Model (LCM)" project book, covering complete engineering implementation details from discrete memory lattices, generation head, to training losses. v3.0 completely rewrites the codebook update mechanism (hybrid EMA/gradient management), the binding lattice unbinding method (conjugate multiplication), routing gating (Gumbel-Softmax), contrast lattice collapse prevention (feature bank), low-rank lattice parameterization (pure gradient), and linear attention normalization, abolishes the FSP module, and separates the inference process into an independent zero-parameter inference engine (see c.md). **v4.0 new**: Generation head (single-layer linear attention+GLU) replaced by **Language LCM** — a complete LCM instance structurally identical to the Cognitive LCM, with codebooks storing semantic-syntactic primitives, constructing linguistic expressions via retrieval and fusion.
 
 ---
 
@@ -553,35 +553,44 @@ class GValueCodebook:
 
 ---
 
-## 5. Generation Head and Inference Engine
+## 5. Language LCM and Dual-Channel Output
 
-### 5.1 Generation Head: Lightweight Language Decoder
+### 5.1 Language LCM: Memory-Driven Language Generation
 
-The generation head receives the inference engine's final output `z_final`, linearly projects it into an initial hidden state, and then performs autoregressive language generation. It does not learn from factual memory; it is only responsible for language fluency.
+The Language LCM (LangLCM) replaces the old lightweight generation head (single-layer causal linear attention + GLU). It is a **complete LCM instance structurally identical to the Cognitive LCM**. Its codebooks store semantic-syntactic primitives (sentence skeletons, argument roles, common collocations, tone/style), constructing expressions via retrieval and fusion of primitives, rather than re-learning language modeling through neural networks.
 
-- **Input**: Inference engine output `z_final ∈ R^{B×d}`, linearly projected to the initial hidden state.
-- **Structure**: Single-layer causal linear attention + GLU, with shared word embedding weights.
-- **Parameters**: < 1M.
-- **Forward pass**:
-  ```python
-  def generation_head(z_final, max_len):
-      hidden = linear_proj(z_final)          # Initial hidden state
-      tokens = [bos_token]
-      for _ in range(max_len):
-          logits, hidden = causal_attn_glu_layer(tokens, hidden)
-          next_token = sample(logits[-1])
-          tokens.append(next_token)
-          if next_token == eos_token: break
-      return tokens
-  ```
+- **Architecture**: encoder → 6 codebooks (HRQ/sparse/lowrank/manifold/binding/contrast) → fusion → W_out → logits
+- **Shared parameters**: token embedding and `W_out` are shared with the Cognitive LCM (same matrix, vocabulary knowledge interoperation)
+- **Training**: Stage 1 standalone training (pure CE loss), Stage 2 integrated as Cognitive LCM's active channel
+
+#### 5.1.1 Forward Pass (Training Mode, Teacher Forcing)
+
+```
+tokens (B, N)
+  → embed[x] → (B, N, d)
+  → causal encoder → (B, N, d)  (each position only sees its prefix)
+  → vmap codebook retrieval+fuse → (B, N, d)  (each position independently retrieves primitives)
+  → W_out → (B, N, V) logits
+```
+
+Generation is autoregressive, token by token: `current token → encoder incremental update → codebook retrieval-fusion → W_out → sample → next token`.
+
+#### 5.1.2 Dual-Channel Output
+
+After the inference engine outputs `z_q`, two paths diverge:
+
+| Channel | Path | Characteristic |
+|---------|------|----------------|
+| **Passive channel** | `z_q @ W_out` | Honest direct readout, transparent, no deception gap |
+| **Active channel** | `z_q → Language LCM retrieves primitives → fusion → W_out` | Rich expression, strong language ability |
 
 ### 5.2 Zero-Parameter Inference Engine
 
-The inference process is completed by the zero-parameter inference engine; see `c.md` for detailed specifications. The generation head does not participate in the inference loop.
+The inference process is completed by the zero-parameter inference engine; see `c.md` for detailed specifications. The Language LCM runs after the inference engine outputs `z_q`, and does not participate in the inference loop.
 
 Core interface:
 - **Input**: `z_q ∈ R^{B×d}` (multi-lattice memory fusion output), optionally receives `z` (encoder raw output).
-- **Output**: `z_final ∈ R^{B×d}`, serving as the generation head's initial hidden state.
+- **Output**: `z_q` is dispatched to the passive channel and the active channel (Language LCM).
 - **Operation mode**: The inference engine's C implementation executes in gradient-free mode (no automatic differentiation involved). The macroscopic scheduler's maximum steps, convergence threshold, and fusion weight entropy threshold are declared in `c.md`.
 - All intermediate graph topologies and execution traces of each primitive produced during the **inference process** can be externally accessed (for interpretability).
 
@@ -589,11 +598,33 @@ Core interface:
 
 ## 6. Training Loss and Parameter Update
 
-### 6.1 Loss Functions
-Total loss:
-`L_total = L_LM + L_VQ + L_contrast + L_orth`
+### 6.1 Training Stages
 
-- `L_LM`: Cross-entropy loss for natural language sequences (includes the final output portion).
+The dual LCM architecture has two training stages:
+
+| Stage | Training Target | Loss | Goal |
+|-------|---------------|------|------|
+| **Stage 1** | Language LCM standalone (pure LM) | `L_lang = CE` | Codebooks converge to semantic-syntactic primitives, generate fluent text independently |
+| **Stage 2** | Cognitive LCM + Language LCM joint | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | Cognitive state z_q outputs via dual channels, distills fluent expression |
+
+### 6.2 Stage 1: Language LCM Loss
+
+The Language LCM trains as a standalone language model. At each forward pass, each token position independently retrieves codebook primitives and fuses them:
+```
+L_lang = cross_entropy(z_q @ W_out, targets)
+```
+All Language LCM parameters (encoder + 6 codebooks + fusion + W_out) participate in training with pure gradient updates. No cognitive loop, introspection, or safety modules at this stage.
+
+### 6.3 Stage 2: Dual LCM Joint Loss
+
+```
+Total loss:
+L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
+```
+
+- **Passive channel loss** `L_passive`: CE loss from `z_q @ W_out` direct readout, honest and transparent.
+- **Active channel loss** `L_active`: CE loss from Language LCM retrieving primitives conditioned on `z_q`, rich expression.
+- **Distillation mechanism**: The passive channel's gradient simultaneously optimizes the Cognitive LCM's codebooks, gradually teaching them the Language LCM's expressive ability.
 - `L_VQ`: Sum of commitment losses for all lattices (including routing).
   Unified form: `L_VQ = Σ_{g∈G} β_g · ‖sg[z_g] − o_g‖²`
   Where `z_g` is the vector input to that lattice (typically `z` or after splitting/projection), and `o_g` is the lattice output. Multi-layer lattice losses already include all residual layers: the number of commitment loss terms is determined by `n_layers` and the lattice structure.
@@ -602,9 +633,9 @@ Total loss:
 - `L_contrast`: Contrast lattice InfoNCE loss (`lax.stop_gradient(z)` blocks encoder gradient), `λ_contrast=0.1`.
 - `L_orth`: `λ_orth Σ_j ‖T_j^T T_j - I‖²`.
 - `L_val`: Optional value contrast loss, only updates each lattice's local `v_j` (global value lattice is frozen).
-- The generation head is trained using only `L_LM`. The inference engine has zero parameters and does not participate in loss computation.
+- The inference engine has zero parameters and does not participate in loss computation.
 
-### 6.2 Parameter Update Rules (Hybrid EMA/Gradient Management)
+### 6.4 Parameter Update Rules (Hybrid EMA/Gradient Management)
 
 | Lattice | Codebook Update Method | Notes |
 |-----|-------------|------|
@@ -619,14 +650,15 @@ Total loss:
 | Danger Lattice `Λ_danger` | **Permanently frozen** (read-only monitoring) | Safety highest priority, see `d.md` for details |
 
 **Gradient descent** (AdamW) updated parameters:
-- All parameters of the encoder and decoder
-- All `A`, `W` matrices of the hyperbolic residual hierarchical lattice
-- Residual low-rank lattice `U_k`, `A_V, W_V`
-- Hyperbolic manifold lattice tangent space `T`
-- All `A`, `W` matrices of the dual-codebook contrast lattice
-- Routing lattice codebook `C_route` and projection `W_route`
-- Scaling factors `α_i`
-- Binding lattice key-value projection matrices `A_k`, `A_v` (reusing low-rank lattice shared basis `V`)
+- Cognitive LCM: all encoder parameters
+- Cognitive LCM: all `A`, `W` matrices of the hyperbolic residual hierarchical lattice
+- Cognitive LCM: residual low-rank lattice `U_k`, `A_V, W_V`
+- Cognitive LCM: hyperbolic manifold lattice tangent space `T`
+- Cognitive LCM: all `A`, `W` matrices of the dual-codebook contrast lattice
+- Cognitive LCM: routing lattice codebook `C_route` and projection `W_route`
+- Cognitive LCM: scaling factors `α_i`
+- Cognitive LCM: binding lattice key-value projection matrices `A_k`, `A_v` (reusing low-rank lattice shared basis `V`)
+- **Language LCM**: all parameters (encoder + 6 codebooks + fusion + W_out) — Stage 1 independent training, Stage 2 optionally frozen or fine-tuned
 
 **EMA updated** codebooks:
 - Sparse lattice codebook (γ_sparse)

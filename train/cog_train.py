@@ -2,16 +2,15 @@
 
 Two output channels from the same conscious state z_q:
   - Passive: z_q @ W_out — transparent, always readable, no deception gap
-  - Active:  gen_head decoder — fluent language skill, loadable from Stage 1
+  - Active:  Language LCM — fluent language model conditioned on cognitive state
 
 The passive channel keeps the model honest (cognitive state is directly readable).
-The active channel gives it full language capabilities without restriction.
+The active channel uses the Stage 1 Language LCM as a frozen decoder that
+generates fluent text from cognitive state z_q (injected as start token).
 
-Passive checkpoint files (gen_head + w_start) from Stage 1 LM training can be
-loaded directly into the active channel via --from-lm-ckpt.
-
-Usage:
-    python lcm.py --cog-train -d zhwiki_tokens.dat --from-lm-ckpt checkpoints/lm_final.pkl
+Usage (Stage 2):
+    python lcm.py --cog-train -d zhwiki_tokens.dat \\
+      --from-lang-ckpt checkpoints/lang_lm/lang_final.pkl
 """
 import os
 import pickle
@@ -25,7 +24,6 @@ import optax
 
 from train.config import LCMConfig
 from train.encoder import init_encoder_params, encoder_forward
-from train.fusion import init_gen_head_params
 from train.lattices import (
     init_hrq_params, init_sparse_params, init_lowrank_params,
     init_manifold_params, init_binding_params, init_contrast_params,
@@ -35,31 +33,47 @@ from train.self_lattice import (
     self_lattice_reg_loss,
 )
 from train.cog_loop import cog_loop_scan
-from train.model import forward as std_forward
-from train.losses import compute_vq_loss
 from train.lattices import contrast_info_nce_loss
+from train.lang_lcm import lang_lcm_forward
 
 
 # ─── Load Stage 2 memory checkpoint ─────────────────────────────────────────
 
 def load_stage2_params(resume, cfg, rng):
-    """Load encoder + all codebooks + gen_head from Stage 2 checkpoint.
+    """Load params from Stage 2 checkpoint (full pickle or legacy .bin format).
 
-    Uses checkpoint.load_checkpoint to read .bin files.
-    Self-state is re-initialised (not persisted in .bin format).
+    Two formats:
+      1. cog_params.pkl (new) — full params dict with lang_lcm, self_state.
+      2. .bin files (old) — loaded via checkpoint.load_checkpoint, no lang_lcm.
 
     Returns:
         (params, self_state)
     """
+    # Try new pickle format first (preserves lang_lcm + self_state)
+    pkl_path = os.path.join(resume, "cog_params.pkl")
+    if os.path.exists(pkl_path):
+        with open(pkl_path, 'rb') as f:
+            ckpt = pickle.load(f)
+        params = jax.tree_util.tree_map(
+            lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
+            ckpt['params'])
+        step = ckpt.get('step', 0)
+        self_state = ckpt.get('self_state')
+        if self_state is None:
+            self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
+        has_lang = 'lang_lcm' in params and params['lang_lcm'] is not None
+        print(f"[COG] Loaded from cog_params.pkl (step {step}, "
+              f"{'incl. lang_lcm' if has_lang else 'no lang_lcm'})")
+        return params, self_state
+
+    # Fallback: legacy .bin format — no lang_lcm, caller must provide --from-lang-ckpt
     from train.checkpoint import load_checkpoint as bin_load
     loaded, _, _, step = bin_load(resume, cfg=cfg, rng=rng, load_opt=False)
 
-    # Copy only the keys cog_train needs (encoder + codebooks + gen_head)
     wanted = ['encoder', 'hrq', 'sparse', 'lowrank', 'manifold',
               'binding', 'contrast', 'self', 'gen_head']
     params = {k: loaded[k] for k in wanted if k in loaded}
 
-    # Self state — not saved in .bin, re-initialise
     self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
 
     print(f"[COG] Loaded Stage 2 checkpoint from {resume} (step {step})")
@@ -70,30 +84,52 @@ def load_stage2_params(resume, cfg, rng):
 
 # ─── Init full params ───────────────────────────────────────────────────────
 
-def _load_gen_head_from_lm(lm_ckpt, params):
-    """Load gen_head + w_start from Stage 1 LM .pkl checkpoint."""
-    print(f"[COG] Loading gen_head from Stage 1: {lm_ckpt}")
-    with open(lm_ckpt, 'rb') as f:
+def _load_lang_lm_checkpoint(lang_ckpt, params):
+    """Load Language LCM params from Stage 1 .pkl checkpoint.
+
+    The Language LCM replaces the old gen_head as the active channel.
+    Its parameters will be frozen (stop_gradient) during cognitive training
+    so the cognitive state z_q must learn to drive the frozen language model.
+    """
+    print(f"[COG] Loading Language LCM from Stage 1: {lang_ckpt}")
+    with open(lang_ckpt, 'rb') as f:
         ckpt = pickle.load(f)
-    params['gen_head'] = jax.tree_util.tree_map(
+    lang_params = jax.tree_util.tree_map(
         lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
-        ckpt['gen_head'])
-    params['w_start'] = jnp.array(ckpt['w_start'])
+        ckpt['lang_params'])
+    # Strip codebook entries (not used in pure-transformer Language LCM)
+    lang_params.pop('codebook_entries', None)
+    for layer in lang_params.get('decoder', []):
+        layer.pop('cb_read', None)
+        layer.pop('ln3_scale', None)
+        layer.pop('ln3_bias', None)
+    # Make sure pos_embed exists
+    if 'pos_embed' not in lang_params:
+        msg = (
+            f"Checkpoint {lang_ckpt} has no pos_embed!\n"
+            f"  Old checkpoints (before the pos_embed fix) were trained without\n"
+            f"  position encoding and CANNOT be used for cognitive training.\n"
+            f"  Train a new Language LCM first:\n"
+            f"    python lcm.py --lang-train --lang-steps 1000 ..."
+        )
+        raise ValueError(msg)
+    params['lang_lcm'] = lang_params
+    print(f"[COG]  Language LCM loaded: {sum(p.size for p in jax.tree_util.tree_leaves(lang_params) if hasattr(p, 'size')):,} params")
 
 
-def init_cog_params(cfg, rng, lm_ckpt=None, resume=None):
-    """Initialize all trainable params.
+def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
+    """Initialize all trainable params for dual-channel cognitive training.
 
-    Two init modes:
-        1. resume: loads encoder + all codebooks + gen_head from
-           Stage 2 checkpoint. gen_head falls back to lm_ckpt if not in .bin.
-        2. From scratch: random init, gen_head from lm_ckpt if provided.
+    Params:
+        encoder + codebooks + W_out: trained in Stage 2 (cognitive).
+        lang_lcm: loaded from Stage 1, frozen (stop_gradient).
 
-    Passive channel: W_out (always from scratch).
-    Active channel: gen_head + w_start.
+    Args:
+        lang_ckpt: Path to Language LCM .pkl checkpoint (Stage 1).
+        resume: Optional Stage 2 checkpoint dir.
 
     Returns:
-        params: Dict of all parameters (including self-lattice).
+        params: Dict of all parameters.
         self_state: Dict for self-lattice runtime state.
     """
     keys = jax.random.split(rng, 12)
@@ -101,23 +137,9 @@ def init_cog_params(cfg, rng, lm_ckpt=None, resume=None):
 
     if resume:
         params, self_state = load_stage2_params(resume, cfg, rng)
-        # W_out always from scratch
         params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
-
-        if 'gen_head' not in params:
-            if lm_ckpt:
-                _load_gen_head_from_lm(lm_ckpt, params)
-            else:
-                params['gen_head'] = init_gen_head_params(keys[8], d, cfg.vocab_size)
-                params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
-        else:
-            # gen_head loaded from Stage 2 — w_start still needed
-            if lm_ckpt:
-                _load_gen_head_from_lm(lm_ckpt, params)  # overwrite with LM version
-            else:
-                params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
     else:
-        # ── Mode 2: init from scratch (original behaviour) ──
+        # ── Init from scratch ──
         params = {}
         params['encoder'] = init_encoder_params(
             keys[0], d, cfg.d_ff, cfg.n_heads, cfg.n_encoder_layers,
@@ -135,11 +157,12 @@ def init_cog_params(cfg, rng, lm_ckpt=None, resume=None):
 
         params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
 
-        if lm_ckpt:
-            _load_gen_head_from_lm(lm_ckpt, params)
-        else:
-            params['gen_head'] = init_gen_head_params(keys[8], d, cfg.vocab_size)
-            params['w_start'] = jax.random.normal(keys[9], (d,)) * (d ** -0.5)
+    # Load frozen Language LCM for active channel (Stage 1 checkpoint)
+    if lang_ckpt:
+        _load_lang_lm_checkpoint(lang_ckpt, params)
+    else:
+        print("[COG] Warning: no Language LCM checkpoint provided; active channel disabled")
+        params['lang_lcm'] = None
 
     return params, self_state
 
@@ -212,43 +235,29 @@ def passive_loss(logits_1d, target_token):
         logits_1d[None, :], jnp.array([target_token])).mean()
 
 
-# ─── Active channel: fluent language skill ──────────────────────────────────
+# ─── Active channel: Language LCM conditioned on cognitive state ────────────
 
-def decoder_forward(gen_head, z_q, x, w_start):
-    """Active channel: autoregressive decoder from cognitive state z_q.
+def active_channel_forward(lang_params, z_q, x, cfg):
+    """Active channel: Language LM from cognitive state z_q.
 
-    Same architecture as Stage 1 LM (train_lm.py). Uses z_q as the start
-    query instead of a learned start vector.
+    The Language LCM (4-layer transformer) is conditioned on z_q by
+    replacing the first position's token embedding with z_q.
+    Language LCM parameters are frozen (caller should use stop_gradient).
+
+    Args:
+        lang_params: Frozen Language LCM parameters.
+        z_q: (B, d) cognitive state.
+        x: (B, N) input token IDs.
+        cfg: LCMConfig.
+
+    Returns:
+        logits: (B, N, V) next-token predictions.
     """
-    B, N = x.shape
-    g = gen_head
-    d = g['w_q'].shape[-1]
-
-    target_emb = g['w_embed'][x]
-    z_q_2d = z_q.reshape(1, 1, -1)
-    z_q_batch = jnp.broadcast_to(z_q_2d, (B, 1, d))
-    inputs = jnp.concatenate([z_q_batch, target_emb], axis=1)
-
-    # Causal linear attention: φ(x) = ELU(x) + 1
-    Q = jax.nn.elu(inputs @ g['w_q']) + 1.0
-    K = jax.nn.elu(inputs @ g['w_k']) + 1.0
-    V = inputs @ g['w_v']
-
-    kv = K[:, :, :, None] @ V[:, :, None, :]
-    kv_cs = jnp.cumsum(kv, axis=1)
-    k_cs = jnp.cumsum(K, axis=1)
-
-    attn = jnp.einsum('bnd,bndd->bnd', Q, kv_cs) / (
-        jnp.einsum('bnd,bnd->bn', Q, k_cs)[:, :, None] + 1e-8)
-    attn_out = attn @ g['w_o']
-
-    # GLU
-    gate = jax.nn.sigmoid(attn_out @ g['w_1'])
-    up = attn_out @ g['w_2']
-    glu_out = gate * up
-
-    logits = glu_out @ g['w_3']
-    return logits[:, 1:, :]  # (B, N, V)
+    # lang_lcm_forward returns (logits, h, aux)
+    logits, _, _ = lang_lcm_forward(
+        lang_params, x, cfg, rng=None, training=False,
+        dropout_rate=0.0, z_q=z_q)
+    return logits  # (B, N, V) — aligns with targets directly
 
 
 def active_loss(logits, targets):
@@ -265,7 +274,10 @@ def make_train_step(cfg, optimizer, joint=False):
 
     Every macro step's z_q feeds both channels:
       - Passive (introspection):  z_q @ W_out → single-token CE
-      - Active (expression):      gen_head(z_q) → full-sequence CE
+      - Active (expression):      Language LCM(z_q) → full-sequence CE
+
+    The Language LCM is frozen (stop_gradient) so the gradient forces the
+    cognitive state z_q to adapt to the frozen language model.
 
     Self-lattice provides internal state machine (mode selection, self output).
 
@@ -285,41 +297,29 @@ def make_train_step(cfg, optimizer, joint=False):
             codebooks = pack_codebooks_for_c(p)
 
             # ── Normalise encoder output to codebook scale ────────────────
-            # Encoder initialisation is unscaled (norm ~14) while codebook
-            # entries live on the unit sphere (norm ~1.4).  Raw Euclidean
-            # distance in the cognitive loop is dominated by scale mismatch,
-            # not semantics.  We project z onto the codebook surface so that
-            # soft_retrieve measures directional similarity.
             cb_mean_norm = jnp.sqrt(sum(
                 jnp.mean(jnp.sum(cb ** 2, axis=-1)) for cb in codebooks
             ) / len(codebooks))
             z_scale = jnp.sqrt(jnp.mean(jnp.sum(z ** 2, axis=-1)))
-            z = z * (cb_mean_norm / (z_scale + 1e-8))  # (B, d)
+            z = z * (cb_mean_norm / (z_scale + 1e-8))
 
-            # ── Adaptive tau: prevent softmax underflow in float32 ──────────
-            # exp(-x) underflows in float32 when x > ~88.  We need
-            # -dist²/(d_model * tau) > -88 so the nearest entry gets
-            # non-zero gradient.  Compute tau from actual distances.
-            # With z norm and cb entries ≈ 1-2, median dist² ≈ 2-8.
-            # We target tau such that -dist²/tau ≈ -20 (safe zone).
+            # ── Adaptive tau ──────────────────────────────────────────────
             sample_cb = codebooks[0]
-            z_sq = jnp.mean(jnp.sum(z ** 2, axis=-1))  # scalar
+            z_sq = jnp.mean(jnp.sum(z ** 2, axis=-1))
             cb_sq = jnp.mean(jnp.sum(sample_cb ** 2, axis=-1))
-            median_dist2_est = z_sq + cb_sq  # E[||z - cb||²] ≈ ||z||² + ||cb||²
-            tau_adaptive = median_dist2_est / 20.0
-            tau_adaptive = jnp.clip(tau_adaptive, 0.1, 10.0)
+            median_dist2_est = z_sq + cb_sq
+            tau_adaptive = jnp.clip(median_dist2_est / 20.0, 0.1, 10.0)
 
-            # ── Batch-aware cognitive loop (vmap over batch) ────────────
-            _tau = tau_adaptive
+            # ── Cognitive loop (vmap over batch) ──────────────────────────
             _cog = lambda zi: cog_loop_scan(
                 zi, codebooks,
                 max_steps=cfg.max_inference_steps,
-                thresholds=None, tau=_tau)
+                thresholds=None, tau=tau_adaptive)
             z_qs, diffs, entropies = jax.vmap(_cog, in_axes=0)(z)
-            # z_qs: (B, max_steps, d), diffs: (B, max_steps)
+            # z_qs: (B, max_steps, d)
 
             # ── Self lattice ────────────────────────────────────────────
-            z_final_mean = z_qs[:, -1, :].mean(axis=0)  # (d,)
+            z_final_mean = z_qs[:, -1, :].mean(axis=0)
             rng_self = rng
             self_state_out = None
             loss_self = jnp.array(0.0)
@@ -329,41 +329,39 @@ def make_train_step(cfg, optimizer, joint=False):
                     rng=rng_self, training=True)
                 loss_self = self_lattice_reg_loss(p['self'], self_state_out)
 
-            # ── Passive channel: (B, max_steps, V) logits → (B,) target ─
-            p_logits = jnp.einsum('bsd,dv->bsv', z_qs, p['W_out'])  # (B, S, V)
-            p_target = targets[:, 0]                                  # (B,)
-            # CE over all steps × batch — mean, not weighted sum
+            # ── Passive channel: z_q @ W_out ────────────────────────────
+            p_logits = jnp.einsum('bsd,dv->bsv', z_qs, p['W_out'])
+            p_target = targets[:, 0]
             p_loss = optax.softmax_cross_entropy_with_integer_labels(
                 p_logits.reshape(-1, p_logits.shape[-1]),
                 p_target[:, None].repeat(cfg.max_inference_steps, axis=1).reshape(-1),
             ).mean()
 
-            # ── Active channel: vmap gen_head over batch ────────────────
-            _decode = lambda z_i, x_i: decoder_forward(
-                p['gen_head'], z_i, x_i[None, :], p['w_start'])[0]
-            a_logits = jax.vmap(_decode, in_axes=(0, 0))(z_qs[:, -1, :], inputs)
-            a_loss = active_loss(a_logits, targets)
+            # ── Active channel: Language LCM (frozen) ────────────────────
+            z_final = z_qs[:, -1, :]  # (B, d)
+            if p.get('lang_lcm') is not None:
+                lang_params = jax.lax.stop_gradient(p['lang_lcm'])
+                a_logits = active_channel_forward(lang_params, z_final, inputs, cfg)
+                a_loss = active_loss(a_logits, targets)
+            else:
+                a_loss = jnp.array(0.0)
 
-            # Convergence bonus (batch-mean)
+            # Convergence bonus
             conv = (diffs[:, -1] < cfg.convergence_tol) & (entropies[:, -1] < cfg.entropy_threshold)
             n_steps = jnp.argmax((diffs < cfg.convergence_tol).astype(jnp.float32), axis=-1) + 1
 
             loss = p_loss + a_loss + loss_self + jnp.mean(
                 jnp.where(conv, -0.001 * jnp.log(n_steps.astype(jnp.float32) + 1e-8), 0.0))
 
-            # ── Stage 3 joint losses (VQ + contrastive + orth) ───────────
+            # ── Stage 3 joint losses ─────────────────────────────────────
             stage3_extra = {}
             if joint:
-                rng_fwd, _ = jax.random.split(rng)
-                _, _, logits_fwd, aux_fwd, _ = std_forward(
-                    p, None, inputs, cfg, training=True, rng=rng_fwd,
-                    self_state=self_state_out)
-                logits_fwd = lax.stop_gradient(logits_fwd)
-
-                vq_comps = compute_vq_loss(p, aux_fwd, z, cfg)
-                vq_total = sum(v for v in vq_comps.values())
+                vq_total = jnp.array(0.0)
+                for cb in codebooks:
+                    dists = jnp.sum((z[:, None, :] - cb[None, :, :]) ** 2, axis=-1)
+                    vq_total = vq_total + jnp.mean(dists.min(axis=-1))
                 stage3_extra['vq'] = vq_total
-                loss = loss + vq_total
+                loss = loss + cfg.beta_vq * vq_total
 
                 if 'contrast' in p:
                     c_loss = cfg.lambda_contrast * contrast_info_nce_loss(
@@ -395,17 +393,19 @@ def make_train_step(cfg, optimizer, joint=False):
 
 def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               seq_len=256, log_every=100, save_every=1000,
-              data_path=None, shape_path=None, lm_ckpt=None,
+              data_path=None, shape_path=None, lang_ckpt=None,
               resume=None, joint=False, auto_mode=False):
-    """Run dual-channel cognitive training.
+    """Run dual-channel cognitive training (Stage 2).
+
+    Dual channels from cognitive state z_q:
+      - Passive: z_q @ W_out (transparent introspection)
+      - Active:  Language LCM(z_q) (fluent language from frozen Stage 1 model)
 
     Args:
-        resume: Optional Stage 2 checkpoint dir. Loads encoder + codebooks
-                + gen_head for joint fine-tuning under cognitive loop.
-        joint: When True, adds Stage 3 losses (VQ commitment + contrastive
-               NCE + manifold orth) on top of the dual-channel losses.
-        auto_mode: When True, enables Supervisor for NaN detection,
-                   auto-rollback, crash recovery, and best checkpoint saving.
+        lang_ckpt: Path to Stage 1 Language LCM .pkl checkpoint.
+        resume: Optional Stage 2 checkpoint dir.
+        joint: When True, adds Stage 3 losses.
+        auto_mode: When True, enables Supervisor.
     """
     from train.data import WikiDataIter
     from tqdm import tqdm
@@ -414,7 +414,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     rng = jax.random.PRNGKey(42)
 
     rng, init_rng = jax.random.split(rng)
-    params, self_state = init_cog_params(cfg, init_rng, lm_ckpt=lm_ckpt,
+    params, self_state = init_cog_params(cfg, init_rng, lang_ckpt=lang_ckpt,
                                           resume=resume)
 
     schedule = optax.cosine_decay_schedule(
@@ -438,16 +438,11 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     d = cfg.d_model
     total_params = sum(p.size for p in jax.tree_util.tree_leaves(params)
                        if hasattr(p, 'size'))
-    has_gh = 'gen_head' in params
-    if resume:
-        gh_src = f"Stage 2{' + LM' if lm_ckpt else ''}"
-    elif lm_ckpt:
-        gh_src = 'LM'
-    else:
-        gh_src = 'random'
-    print(f"[COG] Dual-channel: passive (z_q @ W_out) + active (gen_head{' from ' + gh_src if has_gh else ' init'})")
+    has_lang = 'lang_lcm' in params and params['lang_lcm'] is not None
+    print(f"[COG] Dual-channel: passive (z_q @ W_out) + active (Language LCM{' from Stage 1' if has_lang else ' DISABLED'})")
+    print(f"[COG] Language LCM frozen: {has_lang}")
     print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
-    print(f"[COG] Total params: {total_params:,}")
+    print(f"[COG] Total params: {total_params:,} ({'incl. ' if has_lang else 'excl. '}frozen lang_lcm)")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
     if joint:
         print(f"[COG] Joint mode: + Stage 3 losses (VQ + contrastive + orth)")
@@ -456,13 +451,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     import numpy as _np_np
     V = cfg.vocab_size
     _LN_V = float(_np_np.log(V))  # passive random baseline ≈ 10.31
-    _ACTIVE_FLOOR = 5.06           # Stage 1 gen_head final loss
-    _LOSS_FLOOR = _ACTIVE_FLOOR    # total lower bound (passive → 0, active → floor)
-
-    print(f"[COG] Info theory bounds:")
-    print(f"      passive random: ln(V) = {_LN_V:.2f}")
-    print(f"      active  floor:  Stage 1 baseline = {_ACTIVE_FLOOR:.2f}")
-    print(f"      total   floor:  {_LOSS_FLOOR:.2f}  (gap = loss - {_LOSS_FLOOR:.2f})")
+    _LOSS_FLOOR = 0.0  # active channel floor = 0 (language LCM can reach low loss)
     print()
 
     running_loss = 0.0
@@ -532,7 +521,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         pbar.update(1)
 
     pbar.close()
-    save_cog_checkpoint(params, output_dir, steps, self_state=self_state)
+    final_dir = os.path.join(output_dir, f"step_{steps:06d}")
+    save_cog_checkpoint(params, final_dir, steps, self_state=self_state)
     if sup and sup.best_params is not None:
         sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step)
     print(f"[COG] Training complete → {output_dir}/")
@@ -583,7 +573,7 @@ def _write_flat_cb(dir_path, filename, arrays, cb_type=1):
 def _to_np(x):
     """Convert jax array → numpy, no-op if already numpy."""
     import numpy as _np
-    return _np.array(x) if hasattr(x, 'numpy') else x
+    return _np.asarray(x)
 
 
 def save_cog_checkpoint(params, output_dir, step, self_state=None):
@@ -767,6 +757,7 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
 
 def _write_cb_bin(dir_path, filename, mat, cb_type):
     """Write numpy matrix as LCM binary codebook file with header."""
+    import numpy as _np
     import struct
     buf = bytearray(36)
     M, d = mat.shape
