@@ -27,8 +27,8 @@ class LCMConfig:
     n_hc: int = 2                   # Parallel residual streams (1 = standard residual)
     hc_sinkhorn_iters: int = 5      # Sinkhorn-Knopp iterations for doubly-stochastic mixing
 
-    # V4: Muon optimizer
-    use_muon: bool = True           # Use Muon optimizer (vs AdamW) for matrix params
+    # V4: Muon optimizer (disabled — unsuitable for small models, see train_lang_lcm.py note)
+    use_muon: bool = False          # Muon optimizer for matrix params (default: AdamW)
 
     # Lattice sizes
     n_lattices: int = 6
