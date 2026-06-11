@@ -122,7 +122,7 @@ def _n_heads(cfg):
 def init_lang_lcm_params(rng, cfg):
     """Initialize Language LCM parameters (pure transformer version).
 
-    Architecture: 4-layer transformer decoder with GLU.
+    Architecture: cfg.n_lang_layers-layer transformer decoder with GLU.
     No codebook entries — they'll be added in Stage 2.
 
     Structure:
@@ -133,7 +133,7 @@ def init_lang_lcm_params(rng, cfg):
     """
     keys = jax.random.split(rng, 10)
     d = cfg.d_model
-    n_layers = 4
+    n_layers = getattr(cfg, 'n_lang_layers', 4)
     H = _n_heads(cfg)
 
     params = {}

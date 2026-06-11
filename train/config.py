@@ -16,6 +16,9 @@ class LCMConfig:
     # Encoder
     n_encoder_layers: int = 2
 
+    # Language LCM decoder layers
+    n_lang_layers: int = 8          # Decoder depth (was 4, increased for better syntax)
+
     # Lattice sizes
     n_lattices: int = 6
     M_route: int = 6
