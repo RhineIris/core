@@ -89,17 +89,35 @@ def _newton_schulz(G, iters=5):
       X_{t+1} = X_t @ (3I - X_t @ (3I - X_t)) / 2    (t=0..iters-1)
       return X_{iters} @ G                             ≈ nearest orthogonal
 
+    Handles tensors with ndim > 2 by flattening all but the last dim.
+
     Args:
-        G: (m, n) gradient matrix.
-        iters: Newton-Schulz iterations (default 5).
+        G: (..., m, n) gradient tensor, ndim >= 2.
+        iters: Newton-Schulz iterations.
 
     Returns:
-        (m, n) orthogonalized gradient.
+        Orthogonalized gradient, same shape as G.
     """
+    orig_shape = G.shape
+    if G.ndim == 2:
+        m, n = G.shape
+        G_2d = G
+    else:
+        # Flatten all dims except last: (..., m, n) → (prod(..., m), n)
+        *batch_dims, m, n = G.shape
+        G_2d = G.reshape(-1, n)
+        # Apply Newton-Schulz to the 2D reshaped version
+        result_2d = _apply_ns_2d(G_2d, iters)
+        return result_2d.reshape(orig_shape)
+
+    return _apply_ns_2d(G_2d, iters)
+
+
+def _apply_ns_2d(G, iters=5):
+    """Newton-Schulz on a 2D matrix G (m, n)."""
     m, n = G.shape
     if m > n:
-        # Transpose for efficiency, orthogonalize, transpose back
-        return _newton_schulz(G.T, iters).T
+        return _apply_ns_2d(G.T, iters).T
 
     X = G @ G.T
     I = jnp.eye(m, dtype=G.dtype)
@@ -108,57 +126,39 @@ def _newton_schulz(G, iters=5):
     return X @ G
 
 
-def muon_transform(learning_rate, newton_schulz_iters=5):
+def muon_transform(learning_rate_fn, newton_schulz_iters=5):
     """Muon optimizer: orthogonalize matrix gradients, SGD for vectors.
 
-    For matrix params (ndim >= 2): apply Newton-Schulz orthogonalization
-    then SGD update with the given learning rate.
-    For vector/bias params (ndim < 2): standard SGD (no orthogonalization).
+    Evaluates learning_rate_fn(step_count) inside the JIT'd update
+    to get the current LR.
 
-    This is a simplified version of the Muon optimizer from:
-      Jordan et al., "Muon: An Optimizer for Matrix Parameters" (2024)
+    For matrix params (ndim >= 2): Newton-Schulz orthogonalization → SGD.
+    For vectors (ndim < 2): plain SGD.
+
+    Based on: Jordan et al., "Muon: An Optimizer for Matrix Parameters" (2024)
 
     Args:
-        learning_rate: Learning rate (can be a schedule).
+        learning_rate_fn: callable(step) → scalar LR.
         newton_schulz_iters: Newton-Schulz iterations.
 
     Returns:
         optax.GradientTransformation
     """
-    def _is_matrix(path, param):
-        """Check if a parameter is matrix-shaped (ndim >= 2)."""
-        return param.ndim >= 2
-
     def init_fn(params):
-        return {}
+        return jnp.zeros(())
 
     def update_fn(updates, state, params):
-        new_updates = {}
+        lr = learning_rate_fn(state)  # evaluate schedule at current step
 
-        # Flatten and traverse params
-        flat_updates = jax.tree_util.tree_leaves(updates)
-        flat_params = jax.tree_util.tree_leaves(params)
-        flat_paths = jax.tree_util.tree_structure(updates).flatten_up_to(
-            jax.tree_util.tree_structure(params))
+        def _process(g, p):
+            if g is None:
+                return None
+            if g.ndim >= 2:
+                return -lr * _newton_schulz(g, newton_schulz_iters)
+            return -lr * g
 
-        idx = 0
-        for u, p in zip(flat_updates, flat_params):
-            if u.ndim >= 2:
-                # Matrix param: orthogonalize gradient
-                new_updates[idx] = _newton_schulz(u, newton_schulz_iters)
-            else:
-                # Vector/bias: pass through
-                new_updates[idx] = u
-            idx += 1
-
-        # Reconstruct tree and apply learning rate
-        new_updates_tree = jax.tree_util.tree_unflatten(
-            jax.tree_util.tree_structure(updates),
-            [new_updates[i] for i in range(len(flat_updates))])
-        new_updates_tree = jax.tree_util.tree_map(
-            lambda g: -learning_rate * g, new_updates_tree)
-
-        return new_updates_tree, state
+        new_updates = jax.tree_util.tree_map(_process, updates, params)
+        return new_updates, state + 1
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -175,24 +175,7 @@ def make_optimizer(cfg, steps, lr):
     use_muon = getattr(cfg, 'use_muon', False)
 
     if use_muon:
-        # Muon for matrices + AdamW for vectors, with shared LR schedule
-        muon_opt = muon_transform(learning_rate=schedule)
-        adamw_opt = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=schedule, b1=cfg.adam_beta1,
-                         b2=cfg.adam_beta2, eps=cfg.adam_eps,
-                         weight_decay=cfg.weight_decay),
-        )
-
-        # Selectively apply: matrix params → Muon, others → AdamW
-        def _select_optimizer(path_tuple):
-            if path_tuple is None:
-                return adamw_opt
-            # Check leaf shape
-            return adamw_opt  # default
-
-        # Simpler: just wrap Muon with clip_by_global_norm and weight_decay
-        # applied as separate transforms
+        muon_opt = muon_transform(learning_rate_fn=schedule)
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
             muon_opt,
