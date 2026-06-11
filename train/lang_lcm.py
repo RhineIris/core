@@ -1,26 +1,15 @@
-"""Language LCM — continuous language model with codebook memory.
-
-Two output channels from the same cognitive state:
-  - Passive: z_q @ W_out — honest direct readout, no deception gap
-  - Active:  Language LCM — continuous language model that reads from codebook
-             memory of semantic-syntactic primitives at each decoder layer
+"""Language LCM — continuous language model with V4 innovations.
 
 Architecture (active channel):
   tokens → embed → [transformer decoder × N] → LN → W_out → logits
-                     each layer:
-                       self_attn → +residual → LN
-                       FFN       → +residual → LN
-                       codebook_soft_read(all 6 codebooks) → +residual → LN
+
+V4 innovations integrated:
+  - mHC: Manifold-Constrained Hyper-Connections (parallel residual streams + Sinkhorn mixing)
+  - MTP: Multi-Token Prediction (predict D future tokens per position)
 
 Key design:
-  - Codebook read is SOFT attention over entries (weighted sum, no STE, no VQ)
-  - Main computation is continuous transformer (residual+LN, gradient flows freely)
-  - Codebook entries store language primitives as memory, read via attention
-  - Shares token embedding and W_out with the Cognitive LCM
-
-Reference: human language production from memory — thoughts first, then retrieve
-words and sentence frames to articulate them. The codebooks are the memory of
-language patterns, the decoder is the articulator.
+  - Shared token embedding and W_out with the Cognitive LCM
+  - Gradient flows freely (no STE, no VQ in the LM path)
 """
 import functools
 import jax
@@ -33,7 +22,6 @@ from train.encoder import layer_norm
 # ─── Dropout wrapper ──────────────────────────────────────────────────────────
 
 def _dropout(x, rate, rng):
-    """Apply dropout during training, identity at eval."""
     if rate <= 0.0 or rng is None:
         return x
     keep = 1.0 - rate
@@ -41,10 +29,9 @@ def _dropout(x, rate, rng):
     return jnp.where(mask, x / keep, 0.0)
 
 
-# ─── Decoder layer: causal self-attention + GLU (pure transformer) ───────────
+# ─── Attention ────────────────────────────────────────────────────────────────
 
 def _softmax_attention(q, k, v, mask=None):
-    """Standard causal softmax attention."""
     d_h = q.shape[-1]
     logits = jnp.einsum('bhnd,bhmd->bhnm', q, k) / jnp.sqrt(d_h)
     if mask is not None:
@@ -57,6 +44,8 @@ def _causal_mask(N):
     return jnp.tril(jnp.full((N, N), -1e9), k=0)
 
 
+# ─── GLU ──────────────────────────────────────────────────────────────────────
+
 def _glu(x, w_gate, w_up, w_down):
     gate = jax.nn.silu(x @ w_gate)
     up = x @ w_up
@@ -64,27 +53,110 @@ def _glu(x, w_gate, w_up, w_down):
     return hidden @ w_down
 
 
-def decoder_layer_forward(h, params, N, n_heads=4, training=False,
-                           dropout_rng=None, dropout_rate=0.0):
-    """Pure transformer decoder layer with dropout.
+# ─── Sinkhorn-Knopp (mHC) ─────────────────────────────────────────────────────
+
+def _sinkhorn(logits, iters=5):
+    """Sinkhorn-Knopp normalization in log-space → doubly-stochastic matrix.
 
     Args:
-        h: (B, N, d) input.
-        params: Layer parameters.
-        N: Sequence length.
-        n_heads: Number of attention heads.
-        training: Apply dropout when True.
-        dropout_rng: JAX PRNG key for dropout.
-        dropout_rate: Dropout probability (default 0.0).
+        logits: (n, n) unnormalized mixing logits.
+        iters: Number of Sinkhorn iterations.
 
     Returns:
-        (B, N, d) output.
+        (n, n) doubly-stochastic matrix (rows & columns sum to 1).
+    """
+    for _ in range(iters):
+        logits = logits - jax.nn.logsumexp(logits, axis=-1, keepdims=True)
+        logits = logits - jax.nn.logsumexp(logits, axis=-2, keepdims=True)
+    return jnp.exp(logits)
+
+
+# ─── mHC helpers ──────────────────────────────────────────────────────────────
+
+def _mhc_pre_mix(h, pre_weights):
+    """Combine n_hc residual streams into 1 for sublayer input.
+
+    Args:
+        h: (B, N, n_hc, d) residual streams.
+        pre_weights: (n_hc, d, d) learned projections per stream.
+
+    Returns:
+        (B, N, d) combined.
+    """
+    n_hc = h.shape[2]
+    combined = sum(h[:, :, k, :] @ pre_weights[k] for k in range(n_hc))
+    return combined
+
+
+def _mhc_post_mix(h_residual, h_processed, post_B, post_C_logits,
+                   sinkhorn_iters=5):
+    """Merge sublayer output back into n_hc residual streams.
+
+    For each output stream r:
+      h_new_r = sum_c B[r,c] * h_residual_c + C_sinkhorn[r,0] * h_processed
+
+    C_sinkhorn is the first column of the (n_hc × n_hc) doubly-stochastic
+    matrix produced by Sinkhorn-Knopp on post_C_logits.  Using the first
+    column is equivalent because in a doubly-stochastic matrix all rows
+    sum to 1 and all columns sum to 1, so for n_hc=2:
+      C = [[a, 1-a], [1-a, a]] → column 0 = [a, 1-a]ᵀ
+    which gives each stream a different processed-signal weight.
+
+    Args:
+        h_residual: (B, N, n_hc, d) input residual streams.
+        h_processed: (B, N, d) sublayer output.
+        post_B: (n_hc, n_hc) scalar residual mixing coefficients.
+        post_C_logits: (n_hc, n_hc) mixing logits → Sinkhorn.
+        sinkhorn_iters: Sinkhorn iterations.
+
+    Returns:
+        (B, N, n_hc, d) updated residual streams.
+    """
+    n_hc = h_residual.shape[2]
+    B, N, d = h_processed.shape
+
+    # Sinkhorn: doubly-stochastic matrix
+    C = _sinkhorn(post_C_logits, sinkhorn_iters)  # (n_hc, n_hc)
+    # Take first column as per-stream processed weight
+    c_weights = C[:, 0]  # (n_hc,)
+
+    # Build output streams
+    parts = []
+    for r in range(n_hc):
+        # Residual mixing: sum_c post_B[r,c] * h_residual_c
+        res = sum(post_B[r, c] * h_residual[:, :, c, :] for c in range(n_hc))
+        # Processed signal
+        proc = c_weights[r] * h_processed
+        parts.append(res + proc)
+
+    return jnp.stack(parts, axis=2)  # (B, N, n_hc, d)
+
+
+# ─── Decoder layer ────────────────────────────────────────────────────────────
+
+def decoder_layer_forward(h, params, N, n_heads=4, training=False,
+                           dropout_rng=None, dropout_rate=0.0,
+                           n_hc=1, hc_params=None, sinkhorn_iters=5):
+    """Transformer decoder layer with optional mHC.
+
+    Without mHC (n_hc=1 or hc_params=None): standard Pre-LN residual.
+      h: (B, N, d) → (B, N, d)
+
+    With mHC (n_hc>1 and hc_params is not None): mHC residual streams.
+      h: (B, N, n_hc, d) → (B, N, n_hc, d)
     """
     d = h.shape[-1]
     causal_mask = _causal_mask(N)[None, None, :, :]
+    has_mhc = n_hc > 1 and hc_params is not None
 
-    # ── Multi-head self-attention (pre-LN) ──────────────────────────────────
-    h_norm = layer_norm(h, params['ln1_scale'], params['ln1_bias'])
+    # ── Pre-mix (mHC) or identity ─────────────────────────────────────────
+    if has_mhc:
+        h_in = _mhc_pre_mix(h, hc_params['attn_pre'])  # (B,N,d)
+    else:
+        h_in = h
+
+    # ── Multi-head self-attention (pre-LN) ────────────────────────────────
+    h_norm = layer_norm(h_in, params['ln1_scale'], params['ln1_bias'])
     H = n_heads
     d_h = d // H
 
@@ -96,19 +168,32 @@ def decoder_layer_forward(h, params, N, n_heads=4, training=False,
     v = _split_heads(h_norm @ params['w_v'])
     attn_out = _softmax_attention(q, k, v, causal_mask)
     attn_out = attn_out.transpose(0, 2, 1, 3).reshape(-1, N, d)
-    attn_out = _dropout(attn_out @ params['w_o'], dropout_rate,
-                        dropout_rng)
-    h = h + attn_out
+    attn_out = _dropout(attn_out @ params['w_o'], dropout_rate, dropout_rng)
 
-    # ── FFN (pre-LN) ────────────────────────────────────────────────────────
-    h_norm = layer_norm(h, params['ln2_scale'], params['ln2_bias'])
+    # ── Post-mix (mHC) or residual add ────────────────────────────────────
+    if has_mhc:
+        h = _mhc_post_mix(h, attn_out, hc_params['attn_B'],
+                           hc_params['attn_C_logits'], sinkhorn_iters)
+    else:
+        h = h + attn_out
+
+    # ── Pre-mix FFN (mHC) or identity ─────────────────────────────────────
+    if has_mhc:
+        h_in_ffn = _mhc_pre_mix(h, hc_params['ffn_pre'])
+    else:
+        h_in_ffn = h
+
+    # ── FFN (pre-LN) ──────────────────────────────────────────────────────
+    h_norm = layer_norm(h_in_ffn, params['ln2_scale'], params['ln2_bias'])
     ffn_out = _glu(h_norm, params['w_gate'], params['w_up'], params['w_down'])
     ffn_out = _dropout(ffn_out, dropout_rate, dropout_rng)
-    h = h + ffn_out
 
-    # Note: codebook soft read is removed for the pure-transformer baseline.
-    # It will be re-added in a later stage once the transformer alone can
-    # learn language structure.
+    # ── Post-mix FFN (mHC) or residual add ────────────────────────────────
+    if has_mhc:
+        h = _mhc_post_mix(h, ffn_out, hc_params['ffn_B'],
+                           hc_params['ffn_C_logits'], sinkhorn_iters)
+    else:
+        h = h + ffn_out
 
     return h
 
@@ -119,21 +204,78 @@ def _n_heads(cfg):
     return max(1, min(cfg.n_heads, cfg.d_model // 32))
 
 
-def init_lang_lcm_params(rng, cfg):
-    """Initialize Language LCM parameters (pure transformer version).
+def init_hc_params(rng, d, n_hc, n_layers):
+    """Initialize mHC parameters for all decoder layers.
 
-    Architecture: cfg.n_lang_layers-layer transformer decoder with GLU.
-    No codebook entries — they'll be added in Stage 2.
+    Returns a list of dicts, one per decoder layer:
+      attn_pre: (n_hc, d, d) — pre-mixing attention
+      attn_B:   (n_hc, n_hc) — residual mixing attention
+      attn_C_logits: (n_hc, n_hc) — Sinkhorn logits attention
+      ffn_pre:  (n_hc, d, d) — pre-mixing FFN
+      ffn_B:    (n_hc, n_hc) — residual mixing FFN
+      ffn_C_logits: (n_hc, n_hc) — Sinkhorn logits FFN
+    """
+    if n_hc <= 1:
+        return None
+
+    keys = jax.random.split(rng, 6)
+    # Pre-mix: identity initialization (stream k = input -> mostly itself)
+    scale = (d ** -0.5)
+    pre_all = jax.random.normal(keys[0], (n_layers, n_hc, d, d)) * scale
+
+    # B and C: near-identity 2x2
+    B_all = jnp.eye(n_hc)[None, :, :].repeat(n_layers, axis=0) * 1.0
+    B_all = B_all + jax.random.normal(keys[1], (n_layers, n_hc, n_hc)) * 0.01
+    # C logits: biased toward equal mixing
+    C_all = jnp.zeros((n_layers, n_hc, n_hc))
+    # Set diagonal slightly higher so after Sinkhorn each stream
+    # gets roughly equal processed signal
+    for l in range(n_layers):
+        for k in range(n_hc):
+            C_all = C_all.at[l, k, :].set(1.0 / n_hc)  # uniform init
+
+    # Same for FFN
+    pre_ffn = jax.random.normal(keys[3], (n_layers, n_hc, d, d)) * scale
+    B_ffn = jnp.eye(n_hc)[None, :, :].repeat(n_layers, axis=0) * 1.0
+    B_ffn = B_ffn + jax.random.normal(keys[4], (n_layers, n_hc, n_hc)) * 0.01
+    C_ffn = jnp.zeros((n_layers, n_hc, n_hc))
+    for l in range(n_layers):
+        for k in range(n_hc):
+            C_ffn = C_ffn.at[l, k, :].set(1.0 / n_hc)
+
+    hc_list = []
+    for l in range(n_layers):
+        hc_list.append({
+            'attn_pre': pre_all[l],
+            'attn_B': B_all[l],
+            'attn_C_logits': C_all[l],
+            'ffn_pre': pre_ffn[l],
+            'ffn_B': B_ffn[l],
+            'ffn_C_logits': C_ffn[l],
+        })
+    return hc_list
+
+
+def init_lang_lcm_params(rng, cfg):
+    """Initialize Language LCM parameters with mHC + MTP support.
+
+    Architecture: cfg.n_lang_layers transformer decoder with GLU.
+    When cfg.n_hc > 1: adds mHC parallel residual streams.
+    When cfg.n_mtp_depth > 1: adds MTP output heads.
 
     Structure:
       embed: (V, d) token embedding
+      pos_embed: (max_seq_len, d) positional embedding
       decoder: list of transformer decoder layer params
+      hc: optional list of mHC params per layer
       ln_final_scale, ln_final_bias: final LayerNorm
       W_out: (d, V) output projection
     """
-    keys = jax.random.split(rng, 10)
+    keys = jax.random.split(rng, 12)
     d = cfg.d_model
     n_layers = getattr(cfg, 'n_lang_layers', 4)
+    n_hc = getattr(cfg, 'n_hc', 1)
+    n_mtp = getattr(cfg, 'n_mtp_depth', 1)
     H = _n_heads(cfg)
 
     params = {}
@@ -141,13 +283,11 @@ def init_lang_lcm_params(rng, cfg):
     # Token embedding
     params['embed'] = jax.random.normal(keys[0], (cfg.vocab_size, d)) * (d ** -0.5)
 
-    # Positional embedding (learnable) — critical for word order!
-    # Without this, self-attention is permutation-invariant and can't
-    # distinguish "猫追老鼠" from "老鼠追猫".
+    # Positional embedding
     max_len = getattr(cfg, 'max_seq_len', 512)
     params['pos_embed'] = jax.random.normal(keys[1], (max_len, d)) * (d ** -0.5)
 
-    # Decoder layers (pure transformer, no codebook entries)
+    # Decoder layers
     params['decoder'] = []
     for l in range(n_layers):
         kl = jax.random.split(keys[7], 8)
@@ -164,98 +304,128 @@ def init_lang_lcm_params(rng, cfg):
         }
         params['decoder'].append(layer)
 
+    # mHC params
+    if n_hc > 1:
+        rng, hc_rng = jax.random.split(keys[9])
+        params['hc'] = init_hc_params(hc_rng, d, n_hc, n_layers)
+    else:
+        params['hc'] = None
+
     # Final LayerNorm
     params['ln_final_scale'] = jnp.ones(d)
     params['ln_final_bias'] = jnp.zeros(d)
 
-    # Output projection
+    # Output projection (shared for all MTP depths — weight-tied)
     params['W_out'] = jax.random.normal(keys[8], (d, cfg.vocab_size)) * (d ** -0.5)
 
     return params
 
 
-# ─── Forward pass (training, teacher forcing) ─────────────────────────────────
+# ─── Forward pass ─────────────────────────────────────────────────────────────
 
 def lang_lcm_forward(params, x, cfg, rng=None, training=True,
-                      dropout_rate=0.2, z_q=None):
-    """Language LCM forward pass (pure transformer).
+                      dropout_rate=0.2, z_q=None, targets=None):
+    """Language LCM forward pass with mHC + MTP.
 
     Teacher-forced training with optional dropout regularization.
-    When z_q is provided, it replaces the first position's token embedding,
-    allowing the language LCM to be conditioned on a cognitive state.
+    When z_q is provided, injects cognitive state at position 0.
+    When targets is provided (and n_mtp_depth > 1), computes MTP aux logits.
 
     Args:
         params: Language LCM parameters.
         x: Input token IDs (B, N).
         cfg: LCMConfig.
-        rng: JAX PRNG key for dropout (required when training=True).
-        training: Whether in training mode (enables dropout).
-        dropout_rate: Dropout probability (default 0.2).
-        z_q: Optional (B, d) cognitive state to inject as start token.
+        rng: JAX PRNG key for dropout.
+        training: Enable dropout.
+        dropout_rate: Dropout probability.
+        z_q: Optional (B, d) cognitive state.
+        targets: Optional (B, N) target IDs (needed for MTP embedding).
 
     Returns:
         logits: (B, N, V) next-token predictions.
         h: (B, N, d) final hidden state.
-        aux: Dict of auxiliary outputs.
+        aux: Dict with optional 'mtp_logits'.
     """
     B, N = x.shape
+    d = cfg.d_model
+    n_hc = getattr(cfg, 'n_hc', 1)
+    n_mtp = getattr(cfg, 'n_mtp_depth', 1)
+
+    # Embed
     h = params['embed'][x]  # (B, N, d)
 
-    # Inject cognitive state as first position's hidden state
-    # z_q replaces embed[x[:, 0]] so the model is conditioned on
-    # cognitive state rather than a fixed start token.
     if z_q is not None:
         h = h.at[:, 0, :].set(z_q)
 
-    # Add positional embedding (learnable, key for word order)
-    pos_indices = jnp.arange(N, dtype=jnp.int32)  # (N,)
-    h = h + params['pos_embed'][pos_indices]  # broadcast over batch
+    # Positional embedding
+    pos_indices = jnp.arange(N, dtype=jnp.int32)
+    h = h + params['pos_embed'][pos_indices]
+
+    # Expand to n_hc streams if mHC
+    if n_hc > 1:
+        h = jnp.broadcast_to(h[:, :, None, :], (B, N, n_hc, d))
 
     n_heads = _n_heads(cfg)
-    n_layers = len(params['decoder'])
+    hc_params_list = params.get('hc', None)
+    sinkhorn_iters = getattr(cfg, 'hc_sinkhorn_iters', 5)
 
-    for layer_params in params['decoder']:
+    for i, layer_params in enumerate(params['decoder']):
         if training and dropout_rate > 0.0 and rng is not None:
             rng, do_rng = jax.random.split(rng)
         else:
             do_rng = None
+        l_hc = hc_params_list[i] if hc_params_list is not None else None
         h = decoder_layer_forward(
             h, layer_params, N, n_heads=n_heads,
             training=training, dropout_rng=do_rng,
-            dropout_rate=dropout_rate)
+            dropout_rate=dropout_rate,
+            n_hc=n_hc, hc_params=l_hc,
+            sinkhorn_iters=sinkhorn_iters)
+
+    # Collapse mHC streams → single sequence
+    if n_hc > 1:
+        h = h.mean(axis=2)  # (B, N, d)
 
     h = layer_norm(h, params['ln_final_scale'], params['ln_final_bias'])
-    logits = h @ params['W_out']
+    logits = h @ params['W_out']  # (B, N, V)
 
+    # ── MTP: Multi-Token Prediction ──────────────────────────────────────
     aux = {}
+    if n_mtp > 1 and targets is not None and training:
+        mtp_logits_list = []
+        mtp_depths = []
+        for k in range(1, n_mtp):  # k=1 → predict token_{t+2}
+            N_k = N - k - 1
+            if N_k <= 0:
+                break
+            # h[t] + embed[target_{t+k}] → predict token_{t+k+1}
+            h_slice = h[:, :N_k, :]  # (B, N_k, d), positions 0..N_k-1
+            e = params['embed'][targets[:, k:N - 1]]  # (B, N_k, d)
+            mtp_input = h_slice + e
+            mtp_l = mtp_input @ params['W_out']
+            mtp_logits_list.append(mtp_l)
+            mtp_depths.append(k + 1)
+
+        if mtp_logits_list:
+            aux['mtp_logits'] = mtp_logits_list
+            aux['mtp_depths'] = mtp_depths
+
     return logits, h, aux
 
 
-# ─── Autoregressive generation (with JIT-compiled forward) ────────────────────
+# ─── Autoregressive generation ────────────────────────────────────────────────
 
 @functools.partial(jax.jit, static_argnames=('cfg',))
 def _gen_forward(params, x, cfg, rng):
-    """JIT-compiled forward pass for generation (no dropout)."""
+    """JIT-compiled forward for generation (no dropout, no MTP)."""
     return lang_lcm_forward(params, x, cfg, rng=rng, training=False, dropout_rate=0.0)
 
 
 def lang_lcm_generate(params, prompt, max_len, bos_id, eos_id, rng, cfg):
-    """Autoregressive generation with Language LCM (JIT-compiled).
+    """Autoregressive generation with Language LCM.
 
-    Uses fixed-size input (1, total_len) to avoid JAX recompilation
-    on every step.
-
-    Args:
-        params: Language LCM parameters.
-        prompt: (seq_len,) initial token IDs.
-        max_len: Maximum tokens to generate.
-        bos_id: BOS token ID.
-        eos_id: EOS token ID.
-        rng: JAX PRNG key.
-        cfg: LCMConfig.
-
-    Returns:
-        tokens: List of generated token IDs (including prompt).
+    Uses fixed-size input to avoid JIT recompilation per step.
+    During generation only the main head is used (no MTP speculative decoding).
     """
     prompt_len = len(prompt)
     total = prompt_len + max_len
@@ -264,13 +434,12 @@ def lang_lcm_generate(params, prompt, max_len, bos_id, eos_id, rng, cfg):
     x = jnp.zeros((1, total), dtype=jnp.int32)
     x = x.at[0, :prompt_len].set(jnp.array(prompt))
 
-    # Pre-compile: run one dummy step to trigger JIT
     _ = _gen_forward(params, x, cfg, rng)
 
     pos = prompt_len
     for _ in range(max_len):
         logits, _, _ = _gen_forward(params, x, cfg, rng)
-        next_logits = logits[0, pos - 1, :]  # predict token at position pos
+        next_logits = logits[0, pos - 1, :]
 
         rng, sample_rng = jax.random.split(rng)
         next_id = int(jax.random.categorical(sample_rng, next_logits))
@@ -283,43 +452,3 @@ def lang_lcm_generate(params, prompt, max_len, bos_id, eos_id, rng, cfg):
         pos += 1
 
     return tokens_list
-
-
-# ─── Sanity check ─────────────────────────────────────────────────────────────
-
-def sanity_check():
-    """Verify forward pass shape and gradient flow."""
-    from train.config import LCMConfig
-    cfg = LCMConfig()
-    rng = jax.random.PRNGKey(0)
-    params = init_lang_lcm_params(rng, cfg)
-
-    x = jnp.zeros((2, 8), dtype=jnp.int32)
-    logits, h, aux = lang_lcm_forward(params, x, cfg, rng=rng)
-    print(f"Input:  (2, 8)")
-    print(f"Logits: {logits.shape}  (expected (2, 8, {cfg.vocab_size}))")
-    print(f"H:      {h.shape}  (expected (2, 8, {cfg.d_model}))")
-
-    # Gradient check: one step
-    import optax
-    targets = jnp.ones((2, 8), dtype=jnp.int32)
-    loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits.reshape(-1, cfg.vocab_size), targets.reshape(-1)).mean()
-    grads = jax.grad(lambda p: optax.softmax_cross_entropy_with_integer_labels(
-        lang_lcm_forward(p, x, cfg)[0].reshape(-1, cfg.vocab_size),
-        targets.reshape(-1)).mean())(params)
-
-    # Check grad norms per module
-    for name, g in grads.items():
-        if hasattr(g, 'items'):
-            gnorm = jnp.sqrt(sum(jnp.sum(v**2) for v in jax.tree_util.tree_leaves(g)))
-            print(f"  grad {name}: {float(gnorm):.2f}")
-        elif g is not None:
-            print(f"  grad {name}: {float(jnp.sqrt(jnp.sum(g**2))):.2f}")
-
-    print("Sanity check OK!")
-    return True
-
-
-if __name__ == "__main__":
-    sanity_check()

@@ -19,6 +19,17 @@ class LCMConfig:
     # Language LCM decoder layers
     n_lang_layers: int = 8          # Decoder depth (was 4, increased for better syntax)
 
+    # V4: Multi-Token Prediction (MTP)
+    n_mtp_depth: int = 2            # D: predict current + D-1 future tokens
+    mtp_loss_weight: float = 0.3    # λ weight for future-token prediction loss
+
+    # V4: Manifold-Constrained Hyper-Connections (mHC)
+    n_hc: int = 2                   # Parallel residual streams (1 = standard residual)
+    hc_sinkhorn_iters: int = 5      # Sinkhorn-Knopp iterations for doubly-stochastic mixing
+
+    # V4: Muon optimizer
+    use_muon: bool = True           # Use Muon optimizer (vs AdamW) for matrix params
+
     # Lattice sizes
     n_lattices: int = 6
     M_route: int = 6
