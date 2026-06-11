@@ -35,6 +35,10 @@ from train.self_lattice import (
 from train.cog_loop import cog_loop_scan
 from train.lattices import contrast_info_nce_loss
 from train.lang_lcm import lang_lcm_forward
+from train.qwen_lm import qwen_forward, load_qwen_params, QWEN_CONFIG
+
+# Global Qwen params cache (load once, reuse across calls)
+_QWEN_PARAMS = None
 
 
 # ─── Load Stage 2 memory checkpoint ─────────────────────────────────────────
@@ -117,6 +121,25 @@ def _load_lang_lm_checkpoint(lang_ckpt, params):
     print(f"[COG]  Language LCM loaded: {sum(p.size for p in jax.tree_util.tree_leaves(lang_params) if hasattr(p, 'size')):,} params")
 
 
+def _load_qwen_checkpoint(qwen_path, params, d=256):
+    """Load frozen Qwen2.5-0.5B as active channel.
+
+    Qwen weights stay on CPU (read-only). A trainable z_proj
+    projection layer maps (B, d) cognitive state → (B, 896) Qwen input.
+    """
+    global _QWEN_PARAMS
+    if _QWEN_PARAMS is None:
+        _QWEN_PARAMS = load_qwen_params(qwen_path)
+    params['qwen'] = _QWEN_PARAMS
+    # Trainable projection: z_q (d=256) → Qwen hidden (896)
+    rng = jax.random.PRNGKey(42)
+    qwen_d = QWEN_CONFIG['d_model']
+    params['z_proj'] = jax.random.normal(rng, (qwen_d, d)) * (d ** -0.5)
+    n_layers = QWEN_CONFIG['n_layers']
+    print(f"[COG] Frozen Qwen2.5-0.5B ({n_layers}x{qwen_d}) loaded as active channel")
+    print(f"[COG]  z_proj: ({qwen_d}, {d}) trainable")
+
+
 def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
     """Initialize all trainable params for dual-channel cognitive training.
 
@@ -157,12 +180,18 @@ def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
 
         params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
 
-    # Load frozen Language LCM for active channel (Stage 1 checkpoint)
+    # Load frozen Language LCM for active channel
+    use_qwen = getattr(cfg, 'use_qwen', True)
     if lang_ckpt:
-        _load_lang_lm_checkpoint(lang_ckpt, params)
+        if use_qwen and lang_ckpt.endswith('.npz'):
+            _load_qwen_checkpoint(lang_ckpt, params, d)
+        else:
+            _load_lang_lm_checkpoint(lang_ckpt, params)
     else:
         print("[COG] Warning: no Language LCM checkpoint provided; active channel disabled")
         params['lang_lcm'] = None
+        params['qwen'] = None
+        params['z_proj'] = None
 
     return params, self_state
 
@@ -337,9 +366,17 @@ def make_train_step(cfg, optimizer, joint=False):
                 p_target[:, None].repeat(cfg.max_inference_steps, axis=1).reshape(-1),
             ).mean()
 
-            # ── Active channel: Language LCM (frozen) ────────────────────
+            # ── Active channel: Qwen or Language LCM (frozen) ───────────
             z_final = z_qs[:, -1, :]  # (B, d)
-            if p.get('lang_lcm') is not None:
+            use_qwen = 'qwen' in p and p['qwen'] is not None
+            if use_qwen:
+                qwen_params = jax.lax.stop_gradient(p['qwen'])
+                z_proj = p['z_proj']  # trainable projection
+                a_logits = qwen_forward(qwen_params, inputs,
+                                         z_q=z_final, z_proj=z_proj,
+                                         n_layers=8)  # use 8/24 layers for speed
+                a_loss = active_loss(a_logits, targets)
+            elif p.get('lang_lcm') is not None:
                 lang_params = jax.lax.stop_gradient(p['lang_lcm'])
                 a_logits = active_channel_forward(lang_params, z_final, inputs, cfg)
                 a_loss = active_loss(a_logits, targets)
@@ -439,10 +476,15 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     total_params = sum(p.size for p in jax.tree_util.tree_leaves(params)
                        if hasattr(p, 'size'))
     has_lang = 'lang_lcm' in params and params['lang_lcm'] is not None
-    print(f"[COG] Dual-channel: passive (z_q @ W_out) + active (Language LCM{' from Stage 1' if has_lang else ' DISABLED'})")
-    print(f"[COG] Language LCM frozen: {has_lang}")
+    has_qwen = 'qwen' in params and params['qwen'] is not None
+    if has_qwen:
+        active_name = f"Qwen2.5-0.5B (frozen, {len(params['qwen'])//12} layers)"
+    elif has_lang:
+        active_name = "Language LCM (frozen)"
+    else:
+        active_name = "DISABLED"
+    print(f"[COG] Dual-channel: passive (z_q @ W_out) + active ({active_name})")
     print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
-    print(f"[COG] Total params: {total_params:,} ({'incl. ' if has_lang else 'excl. '}frozen lang_lcm)")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
     if joint:
         print(f"[COG] Joint mode: + Stage 3 losses (VQ + contrastive + orth)")

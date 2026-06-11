@@ -19,6 +19,9 @@ class LCMConfig:
     # Language LCM decoder layers
     n_lang_layers: int = 8          # Decoder depth (was 4, increased for better syntax)
 
+    # Active channel: Qwen2.5-0.5B (frozen) or Language LCM
+    use_qwen: bool = True           # Use frozen Qwen as active channel
+
     # V4: Multi-Token Prediction (MTP)
     n_mtp_depth: int = 2            # D: predict current + D-1 future tokens
     mtp_loss_weight: float = 0.3    # λ weight for future-token prediction loss
