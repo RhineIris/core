@@ -53,6 +53,32 @@ def _glu(x, w_gate, w_up, w_down):
     return hidden @ w_down
 
 
+# ─── Codebook Soft Read ────────────────────────────────────────────────────────
+
+def _codebook_soft_read(h, entries, w_proj, tau=0.5):
+    """Differentiable soft read from a codebook.
+
+    Continuous attention over codebook entries (no STE, no VQ).
+    Hidden states attend to codebook entries via softmax, then the weighted
+    sum of entries is projected back to hidden space as a residual.
+
+    Args:
+        h: (B, N, d) hidden states.
+        entries: (M, d) codebook entries (language primitives).
+        w_proj: (d, d) output projection.
+        tau: Softmax temperature.
+
+    Returns:
+        (B, N, d) readout signal (to be added as residual).
+    """
+    # Attention weights: softmax over entries
+    attn = jax.nn.softmax(h @ entries.T / tau, axis=-1)  # (B, N, M)
+    # Weighted sum: retrieve primitives
+    read = attn @ entries  # (B, N, d)
+    # Project back to hidden space
+    return read @ w_proj
+
+
 # ─── Sinkhorn-Knopp (mHC) ─────────────────────────────────────────────────────
 
 def _sinkhorn(logits, iters=5):
@@ -136,18 +162,23 @@ def _mhc_post_mix(h_residual, h_processed, post_B, post_C_logits,
 
 def decoder_layer_forward(h, params, N, n_heads=4, training=False,
                            dropout_rng=None, dropout_rate=0.0,
-                           n_hc=1, hc_params=None, sinkhorn_iters=5):
-    """Transformer decoder layer with optional mHC.
+                           n_hc=1, hc_params=None, sinkhorn_iters=5,
+                           cb_entries=None, tau_cb=0.5):
+    """Transformer decoder layer with optional mHC + codebook soft read.
 
     Without mHC (n_hc=1 or hc_params=None): standard Pre-LN residual.
       h: (B, N, d) → (B, N, d)
 
     With mHC (n_hc>1 and hc_params is not None): mHC residual streams.
       h: (B, N, n_hc, d) → (B, N, n_hc, d)
+
+    Codebook soft read: after FFN, reads from all 6 shared codebooks and
+    adds the sum as a residual (compatible with both mHC and standard paths).
     """
     d = h.shape[-1]
     causal_mask = _causal_mask(N)[None, None, :, :]
     has_mhc = n_hc > 1 and hc_params is not None
+    has_cb = cb_entries is not None and 'cb_read' in params
 
     # ── Pre-mix (mHC) or identity ─────────────────────────────────────────
     if has_mhc:
@@ -194,6 +225,26 @@ def decoder_layer_forward(h, params, N, n_heads=4, training=False,
                            hc_params['ffn_C_logits'], sinkhorn_iters)
     else:
         h = h + ffn_out
+
+    # ── Codebook soft read (all 6 types) ──────────────────────────────────
+    if has_cb:
+        # If mHC, collapse to single stream for codebook read
+        if has_mhc:
+            h_in_cb = h.mean(axis=2)  # (B, N, d)
+        else:
+            h_in_cb = h
+
+        cb_out = jnp.zeros_like(h_in_cb)
+        for i in range(len(cb_entries)):
+            cb_out = cb_out + _codebook_soft_read(
+                h_in_cb, cb_entries[i], params['cb_read'][i], tau=tau_cb)
+
+        # Add as residual
+        if has_mhc:
+            # Expand back to n_hc streams
+            h = h + cb_out[:, :, None, :]
+        else:
+            h = h + cb_out
 
     return h
 
@@ -287,10 +338,10 @@ def init_lang_lcm_params(rng, cfg):
     max_len = getattr(cfg, 'max_seq_len', 512)
     params['pos_embed'] = jax.random.normal(keys[1], (max_len, d)) * (d ** -0.5)
 
-    # Decoder layers
+    # Decoder layers + codebook read projections
     params['decoder'] = []
     for l in range(n_layers):
-        kl = jax.random.split(keys[7], 8)
+        kl = jax.random.split(keys[7], 10)
         layer = {
             'w_q': jax.random.normal(kl[0], (d, d)) * (d ** -0.5),
             'w_k': jax.random.normal(kl[1], (d, d)) * (d ** -0.5),
@@ -301,8 +352,19 @@ def init_lang_lcm_params(rng, cfg):
             'w_up': jax.random.normal(kl[5], (d, d * 4)) * (d ** -0.5),
             'w_down': jax.random.normal(kl[6], (d * 4, d)) * ((d * 4) ** -0.5),
             'ln2_scale': jnp.ones(d), 'ln2_bias': jnp.zeros(d),
+            # Codebook read projections: one (d, d) per codebook type
+            'cb_read': [jax.random.normal(kl[9 + i // 2], (d, d)) * (d ** -0.5)
+                        for i in range(6)],
         }
         params['decoder'].append(layer)
+
+    # Shared codebook entries (language primitives) — 6 types × 512 entries
+    n_cb_types = 6
+    M_cb = getattr(cfg, 'M_cb', 512)
+    params['cb_entries'] = []
+    for i in range(n_cb_types):
+        cb = jax.random.normal(keys[2 + i % 3], (M_cb, d)) * (d ** -0.5)
+        params['cb_entries'].append(cb)
 
     # mHC params
     if n_hc > 1:
