@@ -163,17 +163,19 @@ def _mhc_post_mix(h_residual, h_processed, post_B, post_C_logits,
 def decoder_layer_forward(h, params, N, n_heads=4, training=False,
                            dropout_rng=None, dropout_rate=0.0,
                            n_hc=1, hc_params=None, sinkhorn_iters=5,
-                           cb_entries=None, tau_cb=0.5):
+                           cb_entries=None, tau_cb=0.1):
     """Transformer decoder layer with optional mHC + codebook soft read.
+
+    Order: self_attn → codebook_soft_read → FFN
+
+    Codebook read is BEFORE FFN so retrieved syntactic primitives inform
+    the FFN's computation, not just decorate its output.
 
     Without mHC (n_hc=1 or hc_params=None): standard Pre-LN residual.
       h: (B, N, d) → (B, N, d)
 
     With mHC (n_hc>1 and hc_params is not None): mHC residual streams.
       h: (B, N, n_hc, d) → (B, N, n_hc, d)
-
-    Codebook soft read: after FFN, reads from all 6 shared codebooks and
-    adds the sum as a residual (compatible with both mHC and standard paths).
     """
     d = h.shape[-1]
     causal_mask = _causal_mask(N)[None, None, :, :]
@@ -208,6 +210,21 @@ def decoder_layer_forward(h, params, N, n_heads=4, training=False,
     else:
         h = h + attn_out
 
+    # ── Codebook soft read (BEFORE FFN, so FFN can use retrieved primitives) ──
+    if has_cb:
+        if has_mhc:
+            h_in_cb = h.mean(axis=2)
+        else:
+            h_in_cb = h
+        cb_out = jnp.zeros_like(h_in_cb)
+        for i in range(len(cb_entries)):
+            cb_out = cb_out + _codebook_soft_read(
+                h_in_cb, cb_entries[i], params['cb_read'][i], tau=tau_cb)
+        if has_mhc:
+            h = h + cb_out[:, :, None, :]
+        else:
+            h = h + cb_out
+
     # ── Pre-mix FFN (mHC) or identity ─────────────────────────────────────
     if has_mhc:
         h_in_ffn = _mhc_pre_mix(h, hc_params['ffn_pre'])
@@ -225,26 +242,6 @@ def decoder_layer_forward(h, params, N, n_heads=4, training=False,
                            hc_params['ffn_C_logits'], sinkhorn_iters)
     else:
         h = h + ffn_out
-
-    # ── Codebook soft read (all 6 types) ──────────────────────────────────
-    if has_cb:
-        # If mHC, collapse to single stream for codebook read
-        if has_mhc:
-            h_in_cb = h.mean(axis=2)  # (B, N, d)
-        else:
-            h_in_cb = h
-
-        cb_out = jnp.zeros_like(h_in_cb)
-        for i in range(len(cb_entries)):
-            cb_out = cb_out + _codebook_soft_read(
-                h_in_cb, cb_entries[i], params['cb_read'][i], tau=tau_cb)
-
-        # Add as residual
-        if has_mhc:
-            # Expand back to n_hc streams
-            h = h + cb_out[:, :, None, :]
-        else:
-            h = h + cb_out
 
     return h
 
