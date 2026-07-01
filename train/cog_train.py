@@ -458,9 +458,12 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         init_value=lr, decay_steps=steps, alpha=0.1)
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, b1=cfg.adam_beta1,
-                     b2=cfg.adam_beta2, eps=cfg.adam_eps,
-                     weight_decay=cfg.weight_decay),
+        optax.masked(
+            optax.adamw(learning_rate=schedule, b1=cfg.adam_beta1,
+                         b2=cfg.adam_beta2, eps=cfg.adam_eps,
+                         weight_decay=cfg.weight_decay),
+            mask=lambda p: 'qwen' not in str(p) and 'lang_lcm' not in str(p),
+        ),
     )
     opt_state = optimizer.init(params)
 

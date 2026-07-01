@@ -248,7 +248,9 @@ class WikiDataIter:
         self.B = B
         self.N = N
         # Memory-map the token array (read-only)
-        self.tokens = np.memmap(mmap_path, dtype=np.uint16, mode='r',
+        _dtype_str = meta.get('dtype', 'uint16')
+        _dtype = np.dtype(_dtype_str)
+        self.tokens = np.memmap(mmap_path, dtype=_dtype, mode='r',
                                 shape=(self.n_tokens,))
 
     def __iter__(self):
