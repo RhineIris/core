@@ -7,6 +7,7 @@
 - Include v3 optimization metadata in CCR size calculation and validate metadata bounds while loading.
 - Give optimization metadata independent 64-byte slots with capacity tracking and copy-on-grow.
 - Add a three-stage corearch bootstrap regression with byte-identical output, O0/O2 CCR loading, and native ELF execution.
+- Replace CCR replay-only coverage with three source-regenerating corec/corearch stages, optional legacy seed pairs, and native smoke execution.
 
 ## 2026-07-23
 ### [fix] complete P0 native aggregate and self-host regressions
